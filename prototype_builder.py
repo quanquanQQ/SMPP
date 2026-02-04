@@ -138,6 +138,8 @@ class PrototypeBuilder:
         """
         # 获取该类别的所有样本
         class_samples = dataset.get_samples_by_class(class_id)
+        if len(class_samples) == 0:
+            raise ValueError(f"No samples found for class {class_id}")
         
         if sampling_strategy == "diverse":
             # 时间多样性: 从不同时间段采样
@@ -148,12 +150,24 @@ class PrototypeBuilder:
             
             # 语义多样性: 子话题过滤
             samples = self._semantic_diverse_sampling(samples)
+            samples = self._pad_to_num_shots(samples, class_samples)
             
         elif sampling_strategy == "random":
-            samples = np.random.choice(class_samples, self.num_shots, replace=False)
+            # Perform random sampling if the strategy is set to random
+            samples = list(np.random.choice(class_samples, min(len(class_samples), self.num_shots), replace=False))
+            samples = self._pad_to_num_shots(samples, class_samples)
         
         elif sampling_strategy == "temporal":
+            # 仅时间采样容易丢失用户/语义多样性，这里做混合采样增强鲁棒性
             samples = self._temporal_diverse_sampling(class_samples)
+            samples = self._user_diverse_sampling(samples)
+            samples = self._semantic_diverse_sampling(samples)
+            samples = self._pad_to_num_shots(samples, class_samples)
+        
+        else:
+            # Default to random sampling if no valid strategy is provided
+            samples = list(np.random.choice(class_samples, min(len(class_samples), self.num_shots), replace=False))
+            samples = self._pad_to_num_shots(samples, class_samples)
         
         images = [sample['image'] for sample in samples]
         texts = [sample['title'] for sample in samples]
@@ -161,11 +175,32 @@ class PrototypeBuilder:
         return images, texts
     
     def _temporal_diverse_sampling(self, samples):
-        """时间多样性采样"""
-        # 按时间戳排序并分段采样
-        sorted_samples = sorted(samples, key=lambda x: x['timestamp'])
-        segment_size = len(sorted_samples) // self.num_shots
-        selected = [sorted_samples[i * segment_size] for i in range(self.num_shots)]
+        """时间多样性采样（对缺失时间戳更鲁棒）"""
+        if len(samples) <= self.num_shots:
+            return list(samples)
+
+        # 过滤无效时间戳，避免 None 集中在最前导致采样失真
+        valid = [s for s in samples if s.get('timestamp') is not None]
+        invalid = [s for s in samples if s.get('timestamp') is None]
+
+        # 如果有效时间戳过少，退化为随机补齐
+        if len(valid) == 0:
+            return list(np.random.choice(samples, self.num_shots, replace=False))
+
+        # 按时间戳排序并均匀采样
+        sorted_samples = sorted(valid, key=lambda x: x.get('timestamp'))
+        if len(sorted_samples) >= self.num_shots:
+            indices = np.linspace(0, len(sorted_samples) - 1, num=self.num_shots, dtype=int)
+            selected = [sorted_samples[i] for i in indices]
+        else:
+            selected = list(sorted_samples)
+
+        # 如不足 num_shots，用剩余样本随机补齐（优先使用无效时间戳样本）
+        if len(selected) < self.num_shots:
+            needed = self.num_shots - len(selected)
+            pool = invalid + [s for s in valid if id(s) not in set(id(x) for x in selected)]
+            if pool:
+                selected.extend(list(np.random.choice(pool, min(needed, len(pool)), replace=False)))
         return selected
     
     def _user_diverse_sampling(self, samples):
@@ -181,12 +216,13 @@ class PrototypeBuilder:
         selected = []
         users = list(user_dict.keys())
         idx = 0
-        while len(selected) < self.num_shots and idx < len(samples):
+        max_iters = len(samples) * 2
+        while len(selected) < self.num_shots and idx < max_iters and users:
             user = users[idx % len(users)]
-            if user_dict[user]:
+            if user_dict.get(user):
                 selected.append(user_dict[user].pop(0))
             idx += 1
-        
+
         return selected
     
     def _semantic_diverse_sampling(self, samples):
@@ -194,16 +230,47 @@ class PrototypeBuilder:
         # 使用聚类或其他方法确保样本覆盖不同子话题
         # 简化版本: 基于文本相似度筛选
         if len(samples) <= self.num_shots:
-            return samples
-        
+            return list(samples)
+
+        def _tokens(text: str):
+            return set(t for t in text.lower().split() if t)
+
+        def _jaccard(a, b):
+            if not a or not b:
+                return 0.0
+            return len(a & b) / max(1, len(a | b))
+
         selected = [samples[0]]
+        selected_tokens = [_tokens(samples[0].get("title", ""))]
         for sample in samples[1:]:
             if len(selected) >= self.num_shots:
                 break
-            # 计算与已选样本的相似度
-            # 如果差异足够大，则加入
-            selected.append(sample)
-        
+            toks = _tokens(sample.get("title", ""))
+            sim = max((_jaccard(toks, t) for t in selected_tokens), default=0.0)
+            if sim < 0.5:
+                selected.append(sample)
+                selected_tokens.append(toks)
+
+        return selected
+
+    def _pad_to_num_shots(self, selected, all_samples):
+        """如果样本不足，随机补齐到 num_shots。"""
+        selected = list(selected)
+        if len(selected) == 0:
+            raise ValueError("No samples available to pad.")
+        if len(selected) >= self.num_shots:
+            return selected[: self.num_shots]
+
+        # 补齐：优先使用未选样本，不足则有放回采样
+        selected_set = set(id(s) for s in selected)
+        remaining = [s for s in all_samples if id(s) not in selected_set]
+        if remaining:
+            needed = self.num_shots - len(selected)
+            take = remaining[:needed]
+            selected.extend(take)
+        if len(selected) < self.num_shots:
+            needed = self.num_shots - len(selected)
+            selected.extend(list(np.random.choice(all_samples, needed, replace=True)))
         return selected
     
     def save_prototypes(self, visual_prototypes, textual_prototypes, save_path):
@@ -220,3 +287,4 @@ class PrototypeBuilder:
         """从文件加载原型"""
         checkpoint = torch.load(load_path)
         return checkpoint['visual_prototypes'], checkpoint['textual_prototypes']
+

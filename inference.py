@@ -3,12 +3,16 @@ Inference and Feature Extraction Script
 推理和特征提取脚本
 """
 
-import torch
-import numpy as np
-from torch.utils.data import DataLoader
+import argparse
 from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from dataset import JSONDataset
 from smpp_model import SMPPModel
 
 
@@ -71,11 +75,12 @@ class FeatureExtractor:
             save_path: 保存路径 (可选)
         
         Returns:
-            features, labels, popularities
+            features, labels, popularities, losses
         """
         all_features = []
         all_labels = []
         all_popularities = []
+        all_losses = []
         
         print("Extracting features...")
         for batch in tqdm(dataloader):
@@ -90,18 +95,35 @@ class FeatureExtractor:
                 popularities = torch.zeros(images.shape[0])
                 user_features = None
             
-            # 提取特征
-            features = self.extract_batch(images, text_tokens, 
-                                         user_features if len(batch) == 5 else None)
+            # 提取特征并计算分类损失
+            images = images.to(self.device)
+            text_tokens = text_tokens.to(self.device)
+            labels = labels.to(self.device)
+            if len(batch) == 5:
+                user_features = user_features.to(self.device)
+            else:
+                user_features = None
+
+            output = self.model(images, text_tokens, labels, return_features=True)
+            features = output['all_features'].detach().cpu().numpy()
+
+            logits = (
+                output['logits_global'] +
+                output['logits_local'] +
+                output['logits_visual']
+            ) / 3
+            batch_loss = F.cross_entropy(logits, labels, reduction='none')
+            all_losses.append(batch_loss.detach().cpu().numpy())
             
             all_features.append(features)
-            all_labels.append(labels.numpy())
-            all_popularities.append(popularities.numpy())
+            all_labels.append(labels.detach().cpu().numpy())
+            all_popularities.append(popularities.detach().cpu().numpy())
         
         # 合并
         features = np.concatenate(all_features, axis=0)
         labels = np.concatenate(all_labels, axis=0)
         popularities = np.concatenate(all_popularities, axis=0)
+        losses = np.concatenate(all_losses, axis=0)
         
         print(f"Extracted {features.shape[0]} samples, feature dim: {features.shape[1]}")
         
@@ -111,17 +133,19 @@ class FeatureExtractor:
                 save_path,
                 features=features,
                 labels=labels,
-                popularities=popularities
+                popularities=popularities,
+                losses=losses
             )
             print(f"Features saved to {save_path}")
         
-        return features, labels, popularities
+        return features, labels, popularities, losses
     
     def filter_by_classification_loss(
         self,
         features: np.ndarray,
         labels: np.ndarray,
         popularities: np.ndarray,
+        losses: np.ndarray,
         loss_threshold_percentile: float = 77.0
     ) -> tuple:
         """
@@ -131,30 +155,29 @@ class FeatureExtractor:
             features: 特征矩阵
             labels: 分类标签
             popularities: 流行度数值
+            losses: 每个样本的分类损失
             loss_threshold_percentile: 保留的百分位数
         
         Returns:
-            filtered_features, filtered_popularities
+            filtered_features, filtered_popularities, filtered_labels
         """
         print(f"\nApplying sample selection (keeping top {loss_threshold_percentile}% samples)...")
         
-        # 计算每个样本的分类损失
-        # 这需要模型的预测结果
-        # 简化版本：随机选择
         num_samples = features.shape[0]
         num_keep = int(num_samples * loss_threshold_percentile / 100)
-        
-        # 实际应该基于分类损失排序
-        # 这里使用随机选择作为示例
-        indices = np.random.choice(num_samples, num_keep, replace=False)
+
+        # 根据分类损失从小到大排序，保留前 77%
+        sorted_indices = np.argsort(losses)
+        indices = sorted_indices[:num_keep]
         indices = np.sort(indices)
         
         filtered_features = features[indices]
         filtered_popularities = popularities[indices]
+        filtered_labels = labels[indices]
         
         print(f"Kept {num_keep}/{num_samples} samples ({loss_threshold_percentile}%)")
         
-        return filtered_features, filtered_popularities
+        return filtered_features, filtered_popularities, filtered_labels
 
 
 class GBDTRegressor:
@@ -268,6 +291,8 @@ def inference_pipeline(
     smpp_model_path: str,
     gbdt_model_path: str,
     test_dataloader: DataLoader,
+    prototype_path: str = None,
+    num_classes: int = 77,
     device: str = "cuda"
 ):
     """
@@ -285,13 +310,12 @@ def inference_pipeline(
     print("Loading models...")
     
     # 1. 加载 SMPP 模型
-    # 需要先创建模型结构
-    from smpp_model import SMPPModel
-    smpp_model = SMPPModel(num_classes=77, device=device)
-    
-    checkpoint = torch.load(smpp_model_path)
-    smpp_model.load_state_dict(checkpoint['model_state_dict'])
-    smpp_model.eval()
+    smpp_model = _load_smpp_model(
+        checkpoint_path=smpp_model_path,
+        prototype_path=prototype_path,
+        num_classes=num_classes,
+        device=device
+    )
     
     # 2. 加载 GBDT 模型
     gbdt_model = GBDTRegressor()
@@ -299,7 +323,7 @@ def inference_pipeline(
     
     # 3. 提取特征
     extractor = FeatureExtractor(smpp_model, device)
-    features, _, _ = extractor.extract_dataset(test_dataloader)
+    features, _, _, _ = extractor.extract_dataset(test_dataloader)
     
     # 4. GBDT 预测
     print("\nPredicting with GBDT...")
@@ -319,7 +343,7 @@ def main():
     
     # 示例 1: 提取特征
     # feature_extractor = FeatureExtractor(model, device)
-    # features, labels, popularities = feature_extractor.extract_dataset(
+    # features, labels, popularities, losses = feature_extractor.extract_dataset(
     #     dataloader, save_path="extracted_features.npz"
     # )
     
@@ -339,5 +363,202 @@ def main():
     print("Inference script ready!")
 
 
+def _build_dataloader(
+    metadata_dir: str,
+    image_dir: str,
+    split: str,
+    clip_preprocess,
+    batch_size: int,
+    num_workers: int,
+    text_field: str,
+    include_user_features: bool
+) -> DataLoader:
+    dataset = JSONDataset(
+        metadata_dir=metadata_dir,
+        image_dir=image_dir,
+        clip_preprocess=clip_preprocess,
+        split=split,
+        text_field=text_field,
+        include_user_features=include_user_features
+    )
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True
+    )
+
+
+def _load_smpp_model(
+    checkpoint_path: str,
+    prototype_path: str,
+    num_classes: int,
+    device: str
+) -> SMPPModel:
+    model = SMPPModel(num_classes=num_classes, device=device)
+
+    if prototype_path and Path(prototype_path).exists():
+        proto_ckpt = torch.load(prototype_path, map_location=device)
+        visual_prototypes = proto_ckpt.get('visual_prototypes')
+        textual_prototypes = proto_ckpt.get('textual_prototypes')
+        if visual_prototypes is not None and textual_prototypes is not None:
+            model.load_prototypes(visual_prototypes, textual_prototypes)
+        else:
+            print("Warning: Prototypes file missing required keys.")
+    else:
+        print("Warning: No prototypes loaded. Please provide --prototype-path.")
+
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    state_dict = checkpoint.get('model_state_dict', checkpoint)
+
+    model.load_state_dict(state_dict, strict=False)
+    model.eval()
+    return model
+
+
+def _load_features_npz(path: str) -> tuple:
+    data = np.load(path)
+    features = data['features']
+    labels = data.get('labels')
+    popularities = data.get('popularities')
+    losses = data.get('losses')
+    return features, labels, popularities, losses
+
+
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="SMPP inference utilities")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # extract-features
+    extract_parser = subparsers.add_parser("extract-features", help="Extract features for GBDT")
+    extract_parser.add_argument("--metadata-dir", required=True)
+    extract_parser.add_argument("--image-dir", required=True)
+    extract_parser.add_argument("--split", default="test", choices=["train", "val", "test"])
+    extract_parser.add_argument("--text-field", default="Title")
+    extract_parser.add_argument("--checkpoint-path", required=True)
+    extract_parser.add_argument("--prototype-path", default=None)
+    extract_parser.add_argument("--num-classes", type=int, default=77)
+    extract_parser.add_argument("--batch-size", type=int, default=128)
+    extract_parser.add_argument("--num-workers", type=int, default=4)
+    extract_parser.add_argument("--include-user-features", action="store_true")
+    extract_parser.add_argument("--save-path", default="extracted_features.npz")
+    extract_parser.add_argument("--filter-percentile", type=float, default=77.0)
+    extract_parser.add_argument("--filtered-save-path", default=None)
+
+    # train-gbdt
+    gbdt_parser = subparsers.add_parser("train-gbdt", help="Train GBDT regressor")
+    gbdt_parser.add_argument("--features-path", required=True)
+    gbdt_parser.add_argument("--model-type", default="lightgbm", choices=["lightgbm", "catboost"])
+    gbdt_parser.add_argument("--save-path", default="gbdt_model.pkl")
+    gbdt_parser.add_argument("--val-size", type=float, default=0.1)
+    gbdt_parser.add_argument("--test-size", type=float, default=0.1)
+
+    # inference
+    infer_parser = subparsers.add_parser("infer", help="Run full inference")
+    infer_parser.add_argument("--metadata-dir", required=True)
+    infer_parser.add_argument("--image-dir", required=True)
+    infer_parser.add_argument("--split", default="test", choices=["train", "val", "test"])
+    infer_parser.add_argument("--text-field", default="Title")
+    infer_parser.add_argument("--checkpoint-path", required=True)
+    infer_parser.add_argument("--prototype-path", default=None)
+    infer_parser.add_argument("--gbdt-model-path", required=True)
+    infer_parser.add_argument("--num-classes", type=int, default=77)
+    infer_parser.add_argument("--batch-size", type=int, default=128)
+    infer_parser.add_argument("--num-workers", type=int, default=4)
+    infer_parser.add_argument("--include-user-features", action="store_true")
+    infer_parser.add_argument("--save-path", default="predictions.npy")
+
+    args = parser.parse_args()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    if args.command == "extract-features":
+        model = _load_smpp_model(
+            checkpoint_path=args.checkpoint_path,
+            prototype_path=args.prototype_path,
+            num_classes=args.num_classes,
+            device=device
+        )
+        dataloader = _build_dataloader(
+            metadata_dir=args.metadata_dir,
+            image_dir=args.image_dir,
+            split=args.split,
+            clip_preprocess=model.preprocess,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            text_field=args.text_field,
+            include_user_features=args.include_user_features
+        )
+        extractor = FeatureExtractor(model, device)
+        features, labels, popularities, losses = extractor.extract_dataset(
+            dataloader, save_path=args.save_path
+        )
+
+        if args.filtered_save_path:
+            filtered_features, filtered_popularities, filtered_labels = (
+                extractor.filter_by_classification_loss(
+                    features,
+                    labels,
+                    popularities,
+                    losses,
+                    loss_threshold_percentile=args.filter_percentile
+                )
+            )
+            np.savez(
+                args.filtered_save_path,
+                features=filtered_features,
+                labels=filtered_labels,
+                popularities=filtered_popularities
+            )
+            print(f"Filtered features saved to {args.filtered_save_path}")
+
+    elif args.command == "train-gbdt":
+        from sklearn.model_selection import train_test_split
+
+        features, _, popularities, _ = _load_features_npz(args.features_path)
+        X_train, X_temp, y_train, y_temp = train_test_split(
+            features,
+            popularities,
+            test_size=(args.val_size + args.test_size),
+            random_state=42
+        )
+        relative_test_size = args.test_size / (args.val_size + args.test_size)
+        X_val, X_test, y_val, y_test = train_test_split(
+            X_temp,
+            y_temp,
+            test_size=relative_test_size,
+            random_state=42
+        )
+
+        gbdt = GBDTRegressor(model_type=args.model_type)
+        gbdt.train(X_train, y_train, X_val, y_val)
+        gbdt.evaluate(X_test, y_test)
+        gbdt.save(args.save_path)
+
+    elif args.command == "infer":
+        model = _load_smpp_model(
+            checkpoint_path=args.checkpoint_path,
+            prototype_path=args.prototype_path,
+            num_classes=args.num_classes,
+            device=device
+        )
+        dataloader = _build_dataloader(
+            metadata_dir=args.metadata_dir,
+            image_dir=args.image_dir,
+            split=args.split,
+            clip_preprocess=model.preprocess,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            text_field=args.text_field,
+            include_user_features=args.include_user_features
+        )
+        predictions = inference_pipeline(
+            smpp_model_path=args.checkpoint_path,
+            gbdt_model_path=args.gbdt_model_path,
+            test_dataloader=dataloader,
+            prototype_path=args.prototype_path,
+            num_classes=args.num_classes,
+            device=device
+        )
+        np.save(args.save_path, predictions)
+        print(f"Predictions saved to {args.save_path}")

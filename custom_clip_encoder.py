@@ -99,6 +99,13 @@ class PromptTextEncoder(nn.Module):
         self.ln_final = clip_model.ln_final
         self.text_projection = clip_model.text_projection
         self.dtype = clip_model.dtype
+        self._attn_mask_cache = {}
+
+    def _build_attention_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
+        mask = torch.empty(seq_len, seq_len, device=device)
+        mask.fill_(float("-inf"))
+        mask.triu_(1)
+        return mask
         
     def forward(
         self, 
@@ -116,13 +123,32 @@ class PromptTextEncoder(nn.Module):
         Returns:
             features: [batch_size, feature_dim] 或 [batch_size, seq_len, feature_dim]
         """
+        # 确保 dtype 与 CLIP 模型一致
+        prompt_embeddings = prompt_embeddings.type(self.dtype)
+
         # 添加位置编码
         seq_len = prompt_embeddings.shape[1]
         x = prompt_embeddings + self.positional_embedding[:seq_len].type(self.dtype)
         
         # Transformer encoding
         x = x.permute(1, 0, 2)  # [seq_len, batch_size, d_model]
-        x = self.transformer(x)
+
+        # Adjust attention mask to current sequence length
+        attn_mask = self._attn_mask_cache.get((seq_len, x.device))
+        if attn_mask is None:
+            attn_mask = self._build_attention_mask(seq_len, x.device)
+            self._attn_mask_cache[(seq_len, x.device)] = attn_mask
+
+        original_masks = []
+        for block in self.transformer.resblocks:
+            original_masks.append(block.attn_mask)
+            block.attn_mask = attn_mask
+        try:
+            x = self.transformer(x)
+        finally:
+            for block, m in zip(self.transformer.resblocks, original_masks):
+                block.attn_mask = m
+
         x = x.permute(1, 0, 2)  # [batch_size, seq_len, d_model]
         
         # Layer normalization

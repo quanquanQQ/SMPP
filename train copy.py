@@ -16,11 +16,10 @@ import lightgbm as lgb
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error, mean_absolute_error
 from scipy.stats import spearmanr
-from catboost import CatBoostRegressor
 
 from smpp_model import SMPPModel, SMPPTrainer
 from prototype_builder import PrototypeBuilder
-from dataset import JSONDataset, DatasetStatistics
+from dataset import JSONDataset
 
 def create_model(
     num_classes: int = 77,
@@ -80,8 +79,8 @@ def build_prototypes(
     device: str = "cuda"
 ):
     """
-    构建原型并保存，使用多样性采样策略。
-
+    构建原型并保存
+    
     Args:
         dataset: 包含所有训练数据的数据集
         num_classes: 类别数量
@@ -89,31 +88,119 @@ def build_prototypes(
         save_path: 保存路径
         device: 计算设备
     """
-    print("Building prototypes with diversity-aware sampling...")
-
+    print("Building prototypes...")
+    
+    # 创建原型构建器
     builder = PrototypeBuilder(
         num_classes=num_classes,
         num_shots=num_shots,
         device=device
     )
-
+    
+    # 为每个类别采样数据
     image_samples = {}
     text_samples = {}
-
+    
     for class_id in range(num_classes):
         print(f"Sampling class {class_id}/{num_classes}")
+        
+        # 从数据集中采样
+        class_samples = dataset.get_samples_by_class(class_id)
+        if len(class_samples) == 0:
+            raise ValueError(f"No samples found for class {class_id}")
 
-        images, texts = builder.sample_diverse_data(dataset, class_id)
+        # 随机采样（样本不足时允许重复采样）
+        replace = len(class_samples) < num_shots
+        sampled_indices = np.random.choice(len(class_samples), size=num_shots, replace=replace)
+
+        images = [class_samples[i]["image"] for i in sampled_indices]
+        texts = [class_samples[i]["title"] for i in sampled_indices]
+
         image_samples[class_id] = images
         text_samples[class_id] = texts
-
+    
+    # 构建视觉和文本原型
     visual_prototypes = builder.build_visual_prototypes(image_samples)
     textual_prototypes = builder.build_textual_prototypes(text_samples)
-
+    
+    # 保存原型
     builder.save_prototypes(visual_prototypes, textual_prototypes, save_path)
     print(f"Prototypes saved to {save_path}")
-
+    
     return visual_prototypes, textual_prototypes
+
+
+def train(
+    model: SMPPModel,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    num_epochs: int = 4,
+    learning_rate: float = 1e-4,
+    weight_decay: float = 1e-5,
+    save_dir: str = "./checkpoints",
+    device: str = "cuda"
+):
+    """
+    训练模型
+    
+    Args:
+        model: SMPP 模型
+        train_loader: 训练数据加载器
+        val_loader: 验证数据加载器
+        num_epochs: 训练轮数
+        learning_rate: 学习率
+        weight_decay: 权重衰减
+        save_dir: 模型保存目录
+        device: 计算设备
+    """
+    # 创建保存目录
+    Path(save_dir).mkdir(parents=True, exist_ok=True)
+    
+    # 优化器
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=learning_rate,
+        weight_decay=weight_decay
+    )
+    
+    # 学习率调度器
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=num_epochs
+    )
+    
+    # 创建训练器
+    trainer = SMPPTrainer(model, optimizer, device)
+    
+    # 训练循环
+    best_val_acc = 0.0
+    
+    for epoch in range(1, num_epochs + 1):
+        print(f"\n{'='*50}")
+        print(f"Epoch {epoch}/{num_epochs}")
+        print(f"{'='*50}")
+        
+        # 训练
+        train_loss, train_acc = trainer.train_epoch(train_loader, epoch)
+        
+        # 验证
+        val_loss, val_acc = trainer.validate(val_loader)
+        
+        # 更新学习率
+        scheduler.step()
+        
+        # 保存最佳模型
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            save_path = Path(save_dir) / f"best_model_epoch{epoch}.pth"
+            trainer.save_checkpoint(save_path, epoch, val_loss)
+            print(f"New best model saved! Validation Accuracy: {val_acc:.2f}%")
+        
+        # 定期保存检查点
+        if epoch % 1 == 0:
+            save_path = Path(save_dir) / f"checkpoint_epoch{epoch}.pth"
+            trainer.save_checkpoint(save_path, epoch, val_loss)
+    
+    print(f"\nTraining completed! Best validation accuracy: {best_val_acc:.2f}%")
 
 
 def extract_features_for_gbdt(
@@ -140,24 +227,14 @@ def extract_features_for_gbdt(
     
     with torch.no_grad():
         for batch in tqdm(dataloader):
-            # 支持用户特征
-            if len(batch) == 5:
-                images, text_tokens, labels, popularities, user_features = batch
-                images = images.to(device)
-                text_tokens = text_tokens.to(device)
-                user_features = user_features.to(device)
-                if isinstance(model, torch.nn.DataParallel):
-                    features = model.module.extract_features_for_regression(images, text_tokens, user_features)
-                else:
-                    features = model.extract_features_for_regression(images, text_tokens, user_features)
-            else:
-                images, text_tokens, labels, popularities = batch
-                images = images.to(device)
-                text_tokens = text_tokens.to(device)
-                if isinstance(model, torch.nn.DataParallel):
-                    features = model.module.extract_features_for_regression(images, text_tokens)
-                else:
-                    features = model.extract_features_for_regression(images, text_tokens)
+            images, text_tokens, labels, popularities = batch
+            images = images.to(device)
+            text_tokens = text_tokens.to(device)
+            
+            # 提取特征
+            # 如果有用户特征，也可以传入
+            features = model.extract_features_for_regression(images, text_tokens)
+            
             all_features.append(features.cpu().numpy())
             all_labels.append(labels.cpu().numpy())
             all_popularities.append(popularities.cpu().numpy())
@@ -181,7 +258,7 @@ def extract_features_for_gbdt(
     return all_features, all_labels, all_popularities
 
 
-def train_gbdt_and_evaluate_with_loss_filter(
+def train_gbdt_and_evaluate(
     model: SMPPModel,
     dataset: JSONDataset,
     device: str = "cuda",
@@ -189,7 +266,7 @@ def train_gbdt_and_evaluate_with_loss_filter(
     random_state: int = 42
 ):
     """
-    使用提取特征训练 LightGBM 和 CatBoost，并融合它们的预测结果，计算 MSE/MAE/Spearman。
+    使用提取特征训练 GBDT，并计算 MSE/MAE/Spearman
     """
     # 划分训练/验证
     indices = np.arange(len(dataset))
@@ -200,15 +277,11 @@ def train_gbdt_and_evaluate_with_loss_filter(
     train_loader = DataLoader(train_subset, batch_size=256, shuffle=False, num_workers=0)
     val_loader = DataLoader(val_subset, batch_size=256, shuffle=False, num_workers=0)
 
-    # 筛选样本
-    keep_indices = filter_samples_by_loss(model, train_loader, keep_ratio=0.77, device=device)
-    train_subset = torch.utils.data.Subset(train_subset, keep_indices)
-
     # 提取特征
     X_train, _, y_train = extract_features_for_gbdt(
         model=model,
-        dataloader=DataLoader(train_subset, batch_size=256, shuffle=False, num_workers=0),
-        save_path="features_train_filtered.npz",
+        dataloader=train_loader,
+        save_path="features_train.npz",
         device=device
     )
     X_val, _, y_val = extract_features_for_gbdt(
@@ -219,7 +292,7 @@ def train_gbdt_and_evaluate_with_loss_filter(
     )
 
     # 训练 LightGBM
-    lgb_reg = lgb.LGBMRegressor(
+    reg = lgb.LGBMRegressor(
         n_estimators=300,
         learning_rate=0.05,
         max_depth=-1,
@@ -228,108 +301,15 @@ def train_gbdt_and_evaluate_with_loss_filter(
         colsample_bytree=0.8,
         random_state=random_state
     )
-    lgb_reg.fit(X_train, y_train)
-    lgb_preds = lgb_reg.predict(X_val)
-
-    # 训练 CatBoost
-    catboost_reg = CatBoostRegressor(
-        iterations=300,
-        learning_rate=0.05,
-        depth=6,
-        random_seed=random_state,
-        verbose=0
-    )
-    catboost_reg.fit(X_train, y_train)
-    catboost_preds = catboost_reg.predict(X_val)
-
-    # 融合 LightGBM 和 CatBoost 的预测结果
-    fused_preds = fusion_model(lgb_preds, catboost_preds, weight_lightgbm=0.5, weight_catboost=0.5)
+    reg.fit(X_train, y_train)
 
     # 评估
-    mse = mean_squared_error(y_val, fused_preds)
-    mae = mean_absolute_error(y_val, fused_preds)
-    spearman = spearmanr(y_val, fused_preds).correlation
+    preds = reg.predict(X_val)
+    mse = mean_squared_error(y_val, preds)
+    mae = mean_absolute_error(y_val, preds)
+    spearman = spearmanr(y_val, preds).correlation
 
     return mse, mae, spearman
-
-
-def fusion_model(lightgbm_preds, catboost_preds, weight_lightgbm=0.5, weight_catboost=0.5):
-    """
-    融合 LightGBM 和 CatBoost 的预测结果。
-
-    Args:
-        lightgbm_preds: LightGBM 的预测结果 (numpy array)
-        catboost_preds: CatBoost 的预测结果 (numpy array)
-        weight_lightgbm: LightGBM 的权重
-        weight_catboost: CatBoost 的权重
-
-    Returns:
-        融合后的预测结果 (numpy array)
-    """
-    # 确保权重和为 1
-    total_weight = weight_lightgbm + weight_catboost
-    weight_lightgbm /= total_weight
-    weight_catboost /= total_weight
-
-    # 加权平均融合
-    fused_preds = (weight_lightgbm * lightgbm_preds) + (weight_catboost * catboost_preds)
-    return fused_preds
-
-
-def filter_samples_by_loss(model, dataloader, keep_ratio=0.77, device="cuda"):
-    """
-    基于分类 Loss 筛选样本。
-
-    Args:
-        model: 训练好的模型
-        dataloader: 数据加载器
-        keep_ratio: 保留的样本比例
-        device: 计算设备
-
-    Returns:
-        筛选后的样本索引
-    """
-    print("Filtering samples based on classification loss...")
-    model.eval()
-    losses = []
-    indices = []
-
-    criterion = torch.nn.CrossEntropyLoss(reduction='none')  # 不求平均，保留每个样本的 loss
-
-    with torch.no_grad():
-        for batch_idx, batch in enumerate(tqdm(dataloader)):
-            if len(batch) >= 3:
-                images, text_tokens, labels = batch[:3]
-            else:
-                continue
-
-            images, text_tokens, labels = images.to(device), text_tokens.to(device), labels.to(device)
-
-            output = model(images, text_tokens, labels)
-            if not isinstance(output, dict):
-                raise ValueError("Model output is not a dict. Expected logits in output dict.")
-
-            logits = (
-                output['logits_global'] +
-                output['logits_local'] +
-                output['logits_visual']
-            ) / 3
-
-            batch_loss = criterion(logits, labels)
-            losses.append(batch_loss.cpu().numpy())
-
-            start = batch_idx * dataloader.batch_size
-            end = start + labels.size(0)
-            indices.extend(range(start, end))
-
-    all_losses = np.concatenate(losses)
-
-    # 找到阈值
-    threshold_idx = int(len(all_losses) * keep_ratio)
-    sorted_indices = np.argsort(all_losses)
-    keep_indices = sorted_indices[:threshold_idx]
-
-    return keep_indices
 
 
 def main():
@@ -345,28 +325,25 @@ def main():
     torch.backends.cudnn.deterministic = True
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
     num_classes = 77
-    batch_size = 96
-    num_epochs = 6
-    learning_rate = 3e-5
-    weight_decay = 5e-5
+    batch_size = 64
+    num_epochs = 8
+    learning_rate = 5e-5
+    weight_decay = 5e-4
     early_stop_patience = 3
     
     # Paths
-    # Use fame_split (same level as prompt): train_new / test_new
-    train_metadata_dir = "/mnt/sda/data/fame_split"
-    test_metadata_dir = "/mnt/sda/data/fame_split"
-    image_dir = "/mnt/sda/data/fame_split"  # Parent of train_new/ and test_new/
+    # Use standard split: train on train_allmetadata_json, validate on test_allmetadata_json
+    train_metadata_dir = "./train_allmetadata_json"
+    test_metadata_dir = "./test_allmetadata_json"
+    image_dir = "/mnt/sda/data/FAME" # Adjust if needed
     
     print(f"Using device: {device}")
 
     # Initialize SwanLab
-    swanlab_project = os.getenv("SWANLAB_PROJECT", "SMPP")
-    swanlab_resume = os.getenv("SWANLAB_RESUME", "allow")
-    swanlab_id = os.getenv("SWANLAB_ID", "")
     swanlab.init(
-        project=swanlab_project,
-        resume=swanlab_resume,
-        id=swanlab_id if swanlab_id else None,
+        project="SMPP",
+        resume="allow",
+        id="5q6h1kf8qvycsd550w2ro",
         config={
             "batch_size": batch_size,
             "num_epochs": num_epochs,
@@ -387,38 +364,18 @@ def main():
         metadata_dir=train_metadata_dir,
         image_dir=image_dir,
         clip_preprocess=preprocess,
-        split="train_new",
-        is_training=True,
-        include_user_features=True
+        split="train"
     )
-
+    
+    # Validation set
     val_dataset = JSONDataset(
         metadata_dir=test_metadata_dir,
         image_dir=image_dir,
         clip_preprocess=preprocess,
-        split="test_new",
-        is_training=False,
-        class_mapping=train_dataset.class_mapping,
-        include_user_features=True
+        split="test",
+        # Use training class mapping to ensure consistency
+        class_mapping=train_dataset.class_mapping 
     )
-
-    reg_dataset = JSONDataset(
-        metadata_dir=train_metadata_dir,
-        image_dir=image_dir,
-        clip_preprocess=preprocess,
-        split="train_new",
-        is_training=False,
-        class_mapping=train_dataset.class_mapping,
-        include_user_features=True
-    )
-
-    # Dataset statistics & visualization
-    try:
-        stats = DatasetStatistics(train_dataset)
-        stats.print_statistics()
-        stats.plot_distribution()
-    except Exception as e:
-        print(f"Warning: Failed to plot dataset statistics: {e}")
     
     # 类别名称
     class_names = [k for k, v in sorted(train_dataset.class_mapping.items(), key=lambda item: item[1])]
@@ -458,15 +415,10 @@ def main():
         class_names=class_names,
         prototype_path=prototype_path,
         device=device,
-        freeze_image=False,
+        freeze_image=True,
         freeze_text=True,
         freeze_text_embedding=True
     )
-
-    # Use two GPUs if available
-    if torch.cuda.is_available() and torch.cuda.device_count() >= 2:
-        print("Using DataParallel on 2 GPUs")
-        model = torch.nn.DataParallel(model, device_ids=[0, 1])
 
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
     print(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.2f}M")
@@ -482,7 +434,7 @@ def main():
     trainer = SMPPTrainer(model, optimizer, device=device)
 
     # Resume from latest checkpoint if available
-    ckpt_dir = Path("checkpoints")
+    ckpt_dir = Path("checkpoints_copy")
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     ckpt_files = list(ckpt_dir.glob("epoch_*.pth"))
     start_epoch = 0
@@ -513,7 +465,7 @@ def main():
             "val/acc": val_acc
         })
 
-        trainer.save_checkpoint(f"checkpoints/epoch_{epoch}.pth", epoch, val_loss)
+        trainer.save_checkpoint(f"checkpoints_copy/epoch_{epoch}.pth", epoch, val_loss)
 
         if val_loss < best_val_loss - 1e-4:
             best_val_loss = val_loss
@@ -530,12 +482,10 @@ def main():
         metadata_dir=train_metadata_dir,
         image_dir=image_dir,
         clip_preprocess=preprocess,
-        split="train_new",
-        is_training=False,
-        class_mapping=train_dataset.class_mapping,
-        include_user_features=True,
+        split="train",
+        class_mapping=train_dataset.class_mapping
     )
-    mse, mae, spearman = train_gbdt_and_evaluate_with_loss_filter(
+    mse, mae, spearman = train_gbdt_and_evaluate(
         model=model,
         dataset=reg_dataset,
         device=device

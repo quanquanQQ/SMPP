@@ -34,8 +34,12 @@ class SMPPModel(nn.Module):
         fusion_hidden_dim: int = 512,
         fusion_num_heads: int = 8,
         fusion_num_layers: int = 2,
+        prompt_dropout: float = 0.1,
         class_names: list = None,
-        device: str = "cuda"
+        device: str = "cuda",
+        freeze_image: bool = False,
+        freeze_text: bool = True,
+        freeze_text_embedding: bool = False
     ):
         """
         Args:
@@ -56,6 +60,8 @@ class SMPPModel(nn.Module):
         
         # 1. 加载 CLIP 模型
         self.clip_model, self.preprocess = clip.load(clip_model_name, device=device)
+        # 强制使用 float32，减少数值溢出导致的 NaN
+        self.clip_model = self.clip_model.float()
         self.feature_dim = self.clip_model.visual.output_dim
         
         # 2. 自定义文本编码器 (返回 h 和 H)
@@ -68,6 +74,7 @@ class SMPPModel(nn.Module):
             class_names=class_names,
             global_ctx_length=global_ctx_length,
             local_ctx_length=local_ctx_length,
+            prompt_dropout=prompt_dropout,
             device=device
         )
         
@@ -93,9 +100,18 @@ class SMPPModel(nn.Module):
         )
         
         # 冻结 CLIP 的部分参数 (可选)
-        self._freeze_clip_backbone()
+        self._freeze_clip_backbone(
+            freeze_image=freeze_image,
+            freeze_text=freeze_text,
+            freeze_text_embedding=freeze_text_embedding
+        )
     
-    def _freeze_clip_backbone(self, freeze_image: bool = False, freeze_text: bool = False):
+    def _freeze_clip_backbone(
+        self,
+        freeze_image: bool = False,
+        freeze_text: bool = False,
+        freeze_text_embedding: bool = False
+    ):
         """冻结 CLIP 的主干网络"""
         if freeze_image:
             for param in self.clip_model.visual.parameters():
@@ -105,6 +121,18 @@ class SMPPModel(nn.Module):
             # 只冻结 transformer，保留 token_embedding 可训练
             for param in self.clip_model.transformer.parameters():
                 param.requires_grad = False
+
+        if freeze_text_embedding:
+            if hasattr(self.clip_model, "token_embedding"):
+                for param in self.clip_model.token_embedding.parameters():
+                    param.requires_grad = False
+            if hasattr(self.clip_model, "positional_embedding"):
+                self.clip_model.positional_embedding.requires_grad = False
+            if hasattr(self.clip_model, "ln_final"):
+                for param in self.clip_model.ln_final.parameters():
+                    param.requires_grad = False
+            if hasattr(self.clip_model, "text_projection"):
+                self.clip_model.text_projection.requires_grad = False
     
     def load_prototypes(self, visual_prototypes: torch.Tensor, textual_prototypes: torch.Tensor):
         """
@@ -167,8 +195,8 @@ class SMPPModel(nn.Module):
         
         # 4. 为每个样本选择对应的原型 (或使用全部原型)
         # 这里简化处理，使用全部原型
-        V = self.visual_prototypes  # [num_classes, feature_dim]
-        T = self.textual_prototypes  # [num_classes, feature_dim]
+        V = self.visual_prototypes.to(dtype=image_features.dtype)  # [num_classes, feature_dim]
+        T = self.textual_prototypes.to(dtype=image_features.dtype)  # [num_classes, feature_dim]
         
         # 对于每个样本，计算其与所有原型的相似度，选择 top-k 或使用所有
         # 这里为了简化，使用平均原型或最相似的原型
@@ -361,7 +389,13 @@ class SMPPTrainer:
         correct = 0
         total = 0
         
-        for batch_idx, (images, text_tokens, labels) in enumerate(dataloader):
+        for batch_idx, batch in enumerate(dataloader):
+            # Unpack batch depending on content
+            if len(batch) == 3:
+                images, text_tokens, labels = batch
+            elif len(batch) >= 4:
+                images, text_tokens, labels, popularities, *extra = batch
+                
             images = images.to(self.device)
             text_tokens = text_tokens.to(self.device)
             labels = labels.to(self.device)
@@ -416,7 +450,13 @@ class SMPPTrainer:
         total = 0
         
         with torch.no_grad():
-            for images, text_tokens, labels in dataloader:
+            for batch in dataloader:
+                # Unpack batch depending on content
+                if len(batch) == 3:
+                    images, text_tokens, labels = batch
+                elif len(batch) >= 4:
+                    images, text_tokens, labels, popularities, *extra = batch
+
                 images = images.to(self.device)
                 text_tokens = text_tokens.to(self.device)
                 labels = labels.to(self.device)
@@ -453,9 +493,23 @@ class SMPPTrainer:
     
     def load_checkpoint(self, path: str):
         """加载模型检查点"""
-        checkpoint = torch.load(path)
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        checkpoint = torch.load(path, map_location=self.device)
+        state_dict = checkpoint['model_state_dict']
+
+        model_is_dp = isinstance(self.model, torch.nn.DataParallel)
+        has_module_prefix = any(k.startswith("module.") for k in state_dict.keys())
+
+        # Align state_dict keys with model
+        if model_is_dp and not has_module_prefix:
+            state_dict = {f"module.{k}": v for k, v in state_dict.items()}
+        elif (not model_is_dp) and has_module_prefix:
+            state_dict = {k.replace("module.", "", 1): v for k, v in state_dict.items()}
+
+        self.model.load_state_dict(state_dict, strict=False)
+        try:
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        except ValueError as e:
+            print(f"Warning: Skipping optimizer state load due to mismatch: {e}")
         epoch = checkpoint['epoch']
         loss = checkpoint['loss']
         print(f"Checkpoint loaded from {path}, Epoch: {epoch}, Loss: {loss:.4f}")
