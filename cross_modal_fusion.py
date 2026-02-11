@@ -110,6 +110,12 @@ class CrossModalFusion(nn.Module):
             T_tilde: 增强后的文本原型特征 [batch_size, hidden_dim]
         """
         batch_size = image_features.shape[0]
+
+        # Ensure dtype consistency with projection layers
+        proj_dtype = self.image_projection[0].weight.dtype
+        image_features = image_features.to(dtype=proj_dtype)
+        visual_prototypes = visual_prototypes.to(dtype=proj_dtype)
+        textual_prototypes = textual_prototypes.to(dtype=proj_dtype)
         
         # 投影到统一维度
         x_proj = self.image_projection(image_features)  # [B, hidden_dim]
@@ -121,7 +127,7 @@ class CrossModalFusion(nn.Module):
         
         # 添加位置编码
         if self.use_pos_encoding:
-            multimodal_input = multimodal_input + self.pos_embedding
+            multimodal_input = multimodal_input + self.pos_embedding.to(multimodal_input.dtype)
         
         # Transformer 自注意力交互
         # [batch_size, 3, hidden_dim]

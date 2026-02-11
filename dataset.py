@@ -9,8 +9,182 @@ from PIL import Image
 import clip
 import pandas as pd
 from pathlib import Path
-from typing import Tuple, Optional
+from typing import Tuple, Optional, List, Dict
 import numpy as np
+import json
+import os
+from collections import defaultdict
+from torchvision import transforms
+
+class JSONDataset(Dataset):
+    """
+    Dataset loader for JSON/TXT file structure
+    """
+    def __init__(
+        self,
+        metadata_dir: str,
+        image_dir: str,
+        clip_preprocess,
+        split: str = "train", # "train" or "test"
+        text_field: str = "Title",
+        include_user_features: bool = False,
+        class_mapping: Optional[Dict[str, int]] = None,
+        is_training: Optional[bool] = None
+    ):
+        """
+        Args:
+            metadata_dir: Directory containing JSON/TXT files
+            image_dir: Directory containing images
+            split: "train" or "test"
+            ...
+        """
+        super().__init__()
+        self.metadata_dir = Path(metadata_dir)
+        self.image_dir = Path(image_dir)
+        self.clip_preprocess = clip_preprocess
+        self.text_field = text_field
+        self.include_user_features = include_user_features
+        self.is_training = (split == "train") if is_training is None else is_training
+
+        # Data augmentation for training only
+        self.augment = transforms.Compose([
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomAffine(degrees=10, translate=(0.1, 0.1)),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2)
+        ])
+        
+        # Load data
+        self.data_prefix = split
+        self._load_data()
+        
+        # Handle categories
+        self.class_mapping = class_mapping
+        if self.class_mapping is None:
+            # Create mapping or use existing
+            unique_cats = sorted(list(set(item['Category'] for item in self.categories)))
+            self.class_mapping = {cat: idx for idx, cat in enumerate(unique_cats)}
+        
+        # Build class indices for sampling
+        self.class_indices = defaultdict(list)
+        for idx, cat_item in enumerate(self.categories):
+            cat_name = cat_item.get('Category') if isinstance(cat_item, dict) else None
+            if cat_name is None:
+                continue
+            class_id = self.class_mapping.get(cat_name)
+            if class_id is None:
+                continue
+            self.class_indices[class_id].append(idx)
+            
+        print(f"Loaded {len(self.image_paths)} samples from {metadata_dir}")
+
+    def _load_data(self):
+        # 1. Image Paths
+        with open(self.metadata_dir / f"{self.data_prefix}_img_filepath.txt", 'r') as f:
+            self.image_paths = [line.strip() for line in f.readlines()]
+            
+        # 2. Text Data
+        with open(self.metadata_dir / f"{self.data_prefix}_text.json", 'r') as f:
+            self.text_data = json.load(f)
+            
+        # 3. Category Data
+        with open(self.metadata_dir / f"{self.data_prefix}_category.json", 'r') as f:
+            self.categories = json.load(f)
+            
+        # 4. Label/Popularity Data
+        # Note: train_label.txt contains popularity scores
+        label_file = self.metadata_dir / f"{self.data_prefix}_label.txt"
+        if label_file.exists():
+            with open(label_file, 'r') as f:
+                self.popularities = [float(line.strip()) for line in f.readlines()]
+        else:
+             # For test set, might not have labels or might be in different format
+             # If missing, use zeros
+             self.popularities = [0.0] * len(self.image_paths)
+
+        # 5. User Data (Optional)
+        if self.include_user_features:
+            with open(self.metadata_dir / f"{self.data_prefix}_user_data.json", 'r') as f:
+                 self.user_data = json.load(f)
+
+    def __len__(self) -> int:
+        return len(self.image_paths)
+
+    def __getitem__(self, idx: int) -> Tuple:
+        # 1. Image
+        # Image paths are like "train/..." or "test/..."
+        # image_dir should be parent of "train" and "test" folders
+        img_rel_path = self.image_paths[idx]
+        image_path = self.image_dir / img_rel_path
+        
+        try:
+            image = Image.open(image_path).convert('RGB')
+            if self.is_training:
+                image = self.augment(image)
+            image = self.clip_preprocess(image)
+        except Exception as e:
+            print(f"Error loading image {image_path}: {e}")
+            # Return dummy image or handle error
+            image = torch.zeros((3, 224, 224)) 
+
+        # 2. Text
+        text_item = self.text_data[idx]
+        text_content = text_item.get(self.text_field, "")
+        if not isinstance(text_content, str):
+            text_content = ""
+        text_tokens = clip.tokenize([text_content[:77]], truncate=True)[0]
+
+        # 3. Label (Category)
+        cat_item = self.categories[idx]
+        cat_name = cat_item['Category']
+        label = self.class_mapping.get(cat_name, 0)
+        
+        # 4. Popularity
+        popularity = self.popularities[idx]
+        
+        # 5. User Features
+        if self.include_user_features:
+             # Logic to extract user features from self.user_data[idx]
+             # This depends on structure of user_data
+             return image, text_tokens, label, popularity, torch.tensor([]) # Placeholder
+        
+        return image, text_tokens, label, popularity
+
+    def get_samples_by_class(self, class_id: int) -> List[Dict]:
+        """
+        Return raw samples for prototype building.
+        Each sample contains image tensor and title text.
+        """
+        indices = self.class_indices.get(class_id, [])
+        samples: List[Dict] = []
+        for idx in indices:
+            # Image
+            img_rel_path = self.image_paths[idx]
+            image_path = self.image_dir / img_rel_path
+            try:
+                image = Image.open(image_path).convert('RGB')
+                image = self.clip_preprocess(image)
+            except Exception:
+                image = torch.zeros((3, 224, 224))
+
+            # Text
+            text_item = self.text_data[idx] if idx < len(self.text_data) else {}
+            if isinstance(text_item, dict):
+                title = text_item.get(self.text_field, "")
+                user_id = text_item.get("Uid")
+            else:
+                title = ""
+                user_id = None
+            if not isinstance(title, str):
+                title = ""
+
+            samples.append({
+                "image": image,
+                "title": title,
+                "user_id": user_id,
+                "timestamp": None
+            })
+
+        return samples
 
 
 class SMPDataset(Dataset):
@@ -157,7 +331,7 @@ class PrototypeDataset(Dataset):
     def _sample_prototypes(self) -> dict:
         """
         为每个类别采样代表性样本
-        考虑时间多样性、用户多样性、语义多样性
+        使用随机采样（移除时间序列采样）
         """
         class_samples = {}
         
@@ -168,10 +342,8 @@ class PrototypeDataset(Dataset):
                 print(f"Warning: Class {class_id} has only {len(class_data)} samples")
                 sampled = class_data
             else:
-                # 时间多样性采样
-                class_data = class_data.sort_values('timestamp')
-                step = len(class_data) // self.num_shots
-                sampled = class_data.iloc[::step][:self.num_shots]
+                # 随机采样
+                sampled = class_data.sample(n=self.num_shots, replace=False, random_state=None)
             
             class_samples[class_id] = sampled.index.tolist()
         

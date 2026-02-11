@@ -122,15 +122,15 @@ class PrototypeBuilder:
         self,
         dataset,
         class_id: int,
-        sampling_strategy: str = "diverse"
+        sampling_strategy: str = "random"
     ) -> Tuple[List[torch.Tensor], List[str]]:
         """
-        采样策略: 考虑时间多样性、语义多样性和用户多样性
+        采样策略: 仅使用随机采样（移除时间序列采样）
         
         Args:
             dataset: 数据集对象
             class_id: 类别ID
-            sampling_strategy: 采样策略 ("diverse", "random", "temporal")
+            sampling_strategy: 采样策略 ("random")
         
         Returns:
             images: 采样的图像列表
@@ -139,21 +139,13 @@ class PrototypeBuilder:
         # 获取该类别的所有样本
         class_samples = dataset.get_samples_by_class(class_id)
         
-        if sampling_strategy == "diverse":
-            # 时间多样性: 从不同时间段采样
-            samples = self._temporal_diverse_sampling(class_samples)
-            
-            # 用户多样性: 尽量选择不同用户的帖子
-            samples = self._user_diverse_sampling(samples)
-            
-            # 语义多样性: 子话题过滤
-            samples = self._semantic_diverse_sampling(samples)
-            
-        elif sampling_strategy == "random":
-            samples = np.random.choice(class_samples, self.num_shots, replace=False)
-        
-        elif sampling_strategy == "temporal":
-            samples = self._temporal_diverse_sampling(class_samples)
+        if sampling_strategy in {"random", "diverse", "temporal"}:
+            if len(class_samples) <= self.num_shots:
+                samples = class_samples
+            else:
+                samples = list(np.random.choice(class_samples, self.num_shots, replace=False))
+        else:
+            raise ValueError(f"Unknown sampling_strategy: {sampling_strategy}")
         
         images = [sample['image'] for sample in samples]
         texts = [sample['title'] for sample in samples]
@@ -162,10 +154,19 @@ class PrototypeBuilder:
     
     def _temporal_diverse_sampling(self, samples):
         """时间多样性采样"""
+        # 过滤掉没有时间戳的样本
+        samples = [sample for sample in samples if sample['timestamp'] is not None]
+
         # 按时间戳排序并分段采样
         sorted_samples = sorted(samples, key=lambda x: x['timestamp'])
-        segment_size = len(sorted_samples) // self.num_shots
-        selected = [sorted_samples[i * segment_size] for i in range(self.num_shots)]
+        
+        # Check if there are enough samples to perform the sampling
+        if len(sorted_samples) < self.num_shots:
+            raise ValueError(f"Not enough samples to perform temporal diverse sampling. Required: {self.num_shots}, Available: {len(sorted_samples)}")
+
+        # Adjust segment size to avoid index out of range
+        segment_size = max(1, len(sorted_samples) // self.num_shots)
+        selected = [sorted_samples[min(i * segment_size, len(sorted_samples) - 1)] for i in range(self.num_shots)]
         return selected
     
     def _user_diverse_sampling(self, samples):

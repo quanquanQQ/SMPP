@@ -24,6 +24,7 @@ class DualGrainedPromptLearner(nn.Module):
         global_ctx_length: int = 16,  # k: global prompt 长度
         local_ctx_length: int = 8,    # s: local prompt 长度
         ctx_dim: int = 512,            # CLIP 的 token embedding 维度
+        dropout: float = 0.1,
         clip_model=None,
         class_names: list = None,
         device: str = "cuda"
@@ -55,6 +56,8 @@ class DualGrainedPromptLearner(nn.Module):
         self.local_ctx = nn.Parameter(
             torch.randn(local_ctx_length, ctx_dim, device=device)
         )
+
+        self.ctx_dropout = nn.Dropout(dropout)
         
         # 初始化类别名称的 embeddings
         if clip_model is not None and class_names is not None:
@@ -111,7 +114,7 @@ class DualGrainedPromptLearner(nn.Module):
             local_prompts: [num_classes, local_ctx_length + 1, ctx_dim]
         """
         # Global Prompt: w_i^G = [θ_{1:k}^G, e_i]
-        global_ctx = self.global_ctx.unsqueeze(0).expand(
+        global_ctx = self.ctx_dropout(self.global_ctx).unsqueeze(0).expand(
             self.num_classes, -1, -1
         )  # [num_classes, k, ctx_dim]
         
@@ -120,7 +123,7 @@ class DualGrainedPromptLearner(nn.Module):
         # [num_classes, k+1, ctx_dim]
         
         # Local Prompt: w_i^L = [θ_{1:s}^L, e_i]
-        local_ctx = self.local_ctx.unsqueeze(0).expand(
+        local_ctx = self.ctx_dropout(self.local_ctx).unsqueeze(0).expand(
             self.num_classes, -1, -1
         )  # [num_classes, s, ctx_dim]
         
@@ -223,7 +226,8 @@ def create_prompt_learner(
     class_names: list = None,
     global_ctx_length: int = 16,
     local_ctx_length: int = 8,
-    device: str = "cuda"
+    device: str = "cuda",
+    prompt_dropout: float = 0.1
 ):
     """
     创建 Prompt Learner 的工厂函数
@@ -251,6 +255,7 @@ def create_prompt_learner(
         global_ctx_length=global_ctx_length,
         local_ctx_length=local_ctx_length,
         ctx_dim=ctx_dim,
+        dropout=prompt_dropout,
         clip_model=clip_model,
         class_names=class_names,
         device=device
