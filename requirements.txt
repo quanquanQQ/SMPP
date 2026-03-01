@@ -8,7 +8,7 @@ torchvision>=0.15.0
 ftfy
 regex
 tqdm
-git+https://github.com/openai/CLIP.git
+# git+https://github.com/openai/CLIP.git
 
 # GBDT Models
 lightgbm>=3.3.0

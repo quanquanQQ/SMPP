@@ -1,7 +1,6 @@
 """
 Training Script for SMPP Model
 完整的训练流程示例
-使用test集进行GBDT
 """
 
 import torch
@@ -10,11 +9,11 @@ from torch.utils.data import DataLoader
 import clip
 from tqdm import tqdm
 import numpy as np
-import random
 from pathlib import Path
 import swanlab
 import os
 import lightgbm as lgb
+from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error, mean_absolute_error
 from scipy.stats import spearmanr
 from catboost import CatBoostRegressor
@@ -173,19 +172,26 @@ def extract_features_for_gbdt(
 
 def train_gbdt_and_evaluate_with_loss_filter(
     model: SMPPModel,
-    train_dataset: JSONDataset,
+    dataset: JSONDataset,
     device: str = "cuda",
+    test_size: float = 0.1,
     random_state: int = 42
 ):
     """
-    使用训练集提取特征训练 LightGBM 和 CatBoost，
-    并在测试集上融合评估 MSE/MAE/Spearman。
+    使用提取特征训练 LightGBM 和 CatBoost，并融合它们的预测结果，计算 MSE/MAE/Spearman。
     """
-    train_loader = DataLoader(train_dataset, batch_size=256, shuffle=False, num_workers=0)
+    # 划分训练/验证
+    indices = np.arange(len(dataset))
+    train_idx, val_idx = train_test_split(indices, test_size=test_size, random_state=random_state)
+    train_subset = torch.utils.data.Subset(dataset, train_idx)
+    val_subset = torch.utils.data.Subset(dataset, val_idx)
+
+    train_loader = DataLoader(train_subset, batch_size=256, shuffle=False, num_workers=0)
+    val_loader = DataLoader(val_subset, batch_size=256, shuffle=False, num_workers=0)
 
     # 筛选样本
     keep_indices = filter_samples_by_loss(model, train_loader, keep_ratio=0.77, device=device)
-    train_subset = torch.utils.data.Subset(train_dataset, keep_indices)
+    train_subset = torch.utils.data.Subset(train_subset, keep_indices)
 
     # 提取特征
     X_train, _, y_train = extract_features_for_gbdt(
@@ -194,10 +200,10 @@ def train_gbdt_and_evaluate_with_loss_filter(
         save_path="features_train_filtered.npz",
         device=device
     )
-    X_train_eval, _, y_train_eval = extract_features_for_gbdt(
+    X_val, _, y_val = extract_features_for_gbdt(
         model=model,
-        dataloader=train_loader,
-        save_path="features_train.npz",
+        dataloader=val_loader,
+        save_path="features_val.npz",
         device=device
     )
 
@@ -212,7 +218,7 @@ def train_gbdt_and_evaluate_with_loss_filter(
         random_state=random_state
     )
     lgb_reg.fit(X_train, y_train)
-    lgb_preds = lgb_reg.predict(X_train_eval)
+    lgb_preds = lgb_reg.predict(X_val)
 
     # 训练 CatBoost
     catboost_reg = CatBoostRegressor(
@@ -223,15 +229,15 @@ def train_gbdt_and_evaluate_with_loss_filter(
         verbose=0
     )
     catboost_reg.fit(X_train, y_train)
-    catboost_preds = catboost_reg.predict(X_train_eval)
+    catboost_preds = catboost_reg.predict(X_val)
 
     # 融合 LightGBM 和 CatBoost 的预测结果
     fused_preds = fusion_model(lgb_preds, catboost_preds, weight_lightgbm=0.5, weight_catboost=0.5)
 
     # 评估
-    mse = mean_squared_error(y_train_eval, fused_preds)
-    mae = mean_absolute_error(y_train_eval, fused_preds)
-    spearman = spearmanr(y_train_eval, fused_preds).correlation
+    mse = mean_squared_error(y_val, fused_preds)
+    mae = mean_absolute_error(y_val, fused_preds)
+    spearman = spearmanr(y_val, fused_preds).correlation
 
     return mse, mae, spearman
 
@@ -315,15 +321,6 @@ def main():
         torch.multiprocessing.set_start_method("spawn", force=True)
     except RuntimeError:
         pass
-
-    seed = int(os.getenv("SEED", "42"))
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
@@ -333,33 +330,24 @@ def main():
     learning_rate = 1e-5
     weight_decay = 5e-4
     early_stop_patience = 2
-    train_split = "train_new"
-    val_split = "test_new"
     
     # Paths
     # Use fame_split (same level as prompt): train_new / test_new
     train_metadata_dir = "/mnt/sda/data/fame_split_37"
     test_metadata_dir = "/mnt/sda/data/fame_split_37"
     image_dir = "/mnt/sda/data/fame_split_37"  # Parent of train_new/ and test_new/
-    # train_metadata_dir = "/mnt/sda/data/fame_split"
-    # test_metadata_dir = "/mnt/sda/data/fame_split"
-    # image_dir = "/mnt/sda/data/fame_split"  # Parent of train_new/ and test_new/
-    # train_metadata_dir = "/mnt/sda/data/fame_split"
-    # test_metadata_dir = "/mnt/sda/data/fame_split"
-    # image_dir = "/mnt/sda/data/fame_split"
     
     print(f"Using device: {device}")
 
     # Initialize SwanLab
     swanlab_project = os.getenv("SWANLAB_PROJECT", "SMPP")
     swanlab_resume = os.getenv("SWANLAB_RESUME", "allow")
-    swanlab_id = os.getenv("SWANLAB_ID", "b6i3k938s6e35bu9iqn20")
+    swanlab_id = os.getenv("SWANLAB_ID", "bg8rk1xguli8ni0atmbs6")
     swanlab.init(
         project=swanlab_project,
         resume=swanlab_resume,
         id=swanlab_id if swanlab_id else None,
         config={
-            "seed": seed,
             "batch_size": batch_size,
             "num_epochs": num_epochs,
             "learning_rate": learning_rate,
@@ -379,19 +367,26 @@ def main():
         metadata_dir=train_metadata_dir,
         image_dir=image_dir,
         clip_preprocess=preprocess,
-        split=train_split,
-        is_training=True,
-        include_user_features=False
+        split="train_new",
+        is_training=True
     )
 
     val_dataset = JSONDataset(
         metadata_dir=test_metadata_dir,
         image_dir=image_dir,
         clip_preprocess=preprocess,
-        split=val_split,
+        split="test_new",
         is_training=False,
-        class_mapping=train_dataset.class_mapping,
-        include_user_features=False
+        class_mapping=train_dataset.class_mapping
+    )
+
+    reg_dataset = JSONDataset(
+        metadata_dir=train_metadata_dir,
+        image_dir=image_dir,
+        clip_preprocess=preprocess,
+        split="train_new",
+        is_training=False,
+        class_mapping=train_dataset.class_mapping
     )
 
     # Dataset statistics & visualization
@@ -423,7 +418,7 @@ def main():
     )
 
     # Step 1: 构建原型 (如果还没有)
-    prototype_path = f"prototypes_{train_split}.pth"
+    prototype_path = "prototypes.pth"
     if not Path(prototype_path).exists():
         build_prototypes(
             dataset=train_dataset,
@@ -505,23 +500,22 @@ def main():
                 print(f"Early stopping at epoch {epoch} (val_loss did not improve).")
                 break
     
-    # Step 4: GBDT Regression Training/Evaluation on Test split
-    print("\nRunning GBDT regression on test split...")
-    gbdt_test_dataset = JSONDataset(
-        metadata_dir=test_metadata_dir,
+    # Step 4: GBDT Regression Evaluation (Original scheme)
+    print("\nRunning GBDT regression evaluation...")
+    reg_dataset = JSONDataset(
+        metadata_dir=train_metadata_dir,
         image_dir=image_dir,
         clip_preprocess=preprocess,
-        split=val_split,
+        split="train_new",
         is_training=False,
         class_mapping=train_dataset.class_mapping,
-        include_user_features=False,
     )
     mse, mae, spearman = train_gbdt_and_evaluate_with_loss_filter(
         model=model,
-        train_dataset=gbdt_test_dataset,
+        dataset=reg_dataset,
         device=device
     )
-    print(f"GBDT Test Metrics - MSE: {mse:.4f}, MAE: {mae:.4f}, Spearman: {spearman:.4f}")
+    print(f"GBDT Metrics - MSE: {mse:.4f}, MAE: {mae:.4f}, Spearman: {spearman:.4f}")
     swanlab.log({
         "gbdt/mse": mse,
         "gbdt/mae": mae,

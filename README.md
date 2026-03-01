@@ -1,10 +1,19 @@
 # Social Media Popularity Prediction (SMPP) Model
 
 完整的 PyTorch 实现，基于跨模态原型增强和双粒度 Prompt Learning。
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .\.venv\Scripts\Activate.ps1
+. venv/bin/activate
+nvidia-smi
+export CUDA_VISIBLE_DEVICES=0
+nohup python train.py > train.log 2>&1 &
+nohup python train.py > train1.log 2>&1 &
+nohup python "train copy".py > train_copy.log 2>&1 &
+ps -ef | grep train.py
+ps -ef | grep "train copy".py
+kill -9 PID
 ## 项目结构
-
+agent使用1：1数据划分得到原型，再用3：7数据训练，结果和全为1：1差不多
+swan_10使用无时序无用户特征，固定随机种子
 ```
 prompt_code/
 ├── prototype_builder.py       # 原型构建模块 (256-shot 采样)

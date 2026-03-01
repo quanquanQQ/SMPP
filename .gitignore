@@ -49,3 +49,19 @@ data/
 datasets/
 *.zip
 *.tar.gz
+
+# Large artifacts (avoid GitHub size limit)
+*.npz
+*.npy
+*.pt
+*.bin
+*.onnx
+*.log
+
+# Experiment directories
+catboost_info/
+checkpoints*/
+models/
+CLIP-main/
+swanlog/
+runs/

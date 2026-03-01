@@ -35,8 +35,7 @@ class FeatureExtractor:
     def extract_batch(
         self,
         images: torch.Tensor,
-        text_tokens: torch.Tensor,
-        user_features: torch.Tensor = None
+        text_tokens: torch.Tensor
     ) -> np.ndarray:
         """
         提取一个 batch 的特征
@@ -44,21 +43,15 @@ class FeatureExtractor:
         Args:
             images: [batch_size, 3, H, W]
             text_tokens: [batch_size, seq_len]
-            user_features: [batch_size, user_feature_dim] (可选)
         
         Returns:
             features: [batch_size, feature_dim]
         """
         images = images.to(self.device)
         text_tokens = text_tokens.to(self.device)
-        
-        if user_features is not None:
-            user_features = user_features.to(self.device)
-        
+
         # 提取特征
-        features = self.model.extract_features_for_regression(
-            images, text_tokens, user_features
-        )
+        features = self.model.extract_features_for_regression(images, text_tokens)
         
         return features.cpu().numpy()
     
@@ -84,25 +77,12 @@ class FeatureExtractor:
         
         print("Extracting features...")
         for batch in tqdm(dataloader):
-            # 根据数据集格式解包
-            if len(batch) == 4:
-                images, text_tokens, labels, popularities = batch
-            elif len(batch) == 5:
-                images, text_tokens, labels, popularities, user_features = batch
-            else:
-                images, text_tokens = batch[:2]
-                labels = torch.zeros(images.shape[0])
-                popularities = torch.zeros(images.shape[0])
-                user_features = None
+            images, text_tokens, labels, popularities = batch
             
             # 提取特征并计算分类损失
             images = images.to(self.device)
             text_tokens = text_tokens.to(self.device)
             labels = labels.to(self.device)
-            if len(batch) == 5:
-                user_features = user_features.to(self.device)
-            else:
-                user_features = None
 
             output = self.model(images, text_tokens, labels, return_features=True)
             features = output['all_features'].detach().cpu().numpy()
@@ -370,16 +350,14 @@ def _build_dataloader(
     clip_preprocess,
     batch_size: int,
     num_workers: int,
-    text_field: str,
-    include_user_features: bool
+    text_field: str
 ) -> DataLoader:
     dataset = JSONDataset(
         metadata_dir=metadata_dir,
         image_dir=image_dir,
         clip_preprocess=clip_preprocess,
         split=split,
-        text_field=text_field,
-        include_user_features=include_user_features
+        text_field=text_field
     )
     return DataLoader(
         dataset,
@@ -441,7 +419,6 @@ if __name__ == "__main__":
     extract_parser.add_argument("--num-classes", type=int, default=77)
     extract_parser.add_argument("--batch-size", type=int, default=128)
     extract_parser.add_argument("--num-workers", type=int, default=0)
-    extract_parser.add_argument("--include-user-features", action="store_true")
     extract_parser.add_argument("--save-path", default="extracted_features.npz")
     extract_parser.add_argument("--filter-percentile", type=float, default=77.0)
     extract_parser.add_argument("--filtered-save-path", default=None)
@@ -466,7 +443,6 @@ if __name__ == "__main__":
     infer_parser.add_argument("--num-classes", type=int, default=77)
     infer_parser.add_argument("--batch-size", type=int, default=128)
     infer_parser.add_argument("--num-workers", type=int, default=0)
-    infer_parser.add_argument("--include-user-features", action="store_true")
     infer_parser.add_argument("--save-path", default="predictions.npy")
 
     args = parser.parse_args()
@@ -486,8 +462,7 @@ if __name__ == "__main__":
             clip_preprocess=model.preprocess,
             batch_size=args.batch_size,
             num_workers=args.num_workers,
-            text_field=args.text_field,
-            include_user_features=args.include_user_features
+            text_field=args.text_field
         )
         extractor = FeatureExtractor(model, device)
         features, labels, popularities, losses = extractor.extract_dataset(
@@ -549,8 +524,7 @@ if __name__ == "__main__":
             clip_preprocess=model.preprocess,
             batch_size=args.batch_size,
             num_workers=args.num_workers,
-            text_field=args.text_field,
-            include_user_features=args.include_user_features
+            text_field=args.text_field
         )
         predictions = inference_pipeline(
             smpp_model_path=args.checkpoint_path,

@@ -43,7 +43,7 @@ class JSONDataset(Dataset):
         self.image_dir = Path(image_dir)
         self.clip_preprocess = clip_preprocess
         self.text_field = text_field
-        self.include_user_features = include_user_features
+        self.include_user_features = False
         self.is_training = (split == "train") if is_training is None else is_training
 
         # Data augmentation for training only
@@ -55,7 +55,6 @@ class JSONDataset(Dataset):
         
         # Load data
         self.data_prefix = split
-        self._missing_image_logs = 0
         self._load_data()
         
         # Handle categories
@@ -77,44 +76,6 @@ class JSONDataset(Dataset):
             self.class_indices[class_id].append(idx)
             
         print(f"Loaded {len(self.image_paths)} samples from {metadata_dir}")
-
-    def _resolve_image_path(self, img_rel_path: str) -> Path:
-        """Resolve image path with split-prefix fallback (train/train_new, test/test_new)."""
-        rel_path = Path(img_rel_path)
-        candidates: List[Path] = []
-
-        if rel_path.is_absolute():
-            candidates.append(rel_path)
-        else:
-            candidates.append(self.image_dir / rel_path)
-
-        if rel_path.parts:
-            prefix = rel_path.parts[0]
-            rest = rel_path.parts[1:]
-            alt_prefix = {
-                "train": "train_new",
-                "train_new": "train",
-                "test": "test_new",
-                "test_new": "test",
-            }.get(prefix)
-            if alt_prefix is not None:
-                candidates.append(self.image_dir / Path(alt_prefix).joinpath(*rest))
-
-            if prefix in {"train", "train_new", "test", "test_new"}:
-                candidates.append(self.image_dir / Path(self.data_prefix).joinpath(*rest))
-        else:
-            candidates.append(self.image_dir / self.data_prefix / rel_path)
-
-        seen = set()
-        for candidate in candidates:
-            key = str(candidate)
-            if key in seen:
-                continue
-            seen.add(key)
-            if candidate.exists():
-                return candidate
-
-        return candidates[0]
 
     def _load_data(self):
         # 1. Image Paths
@@ -140,10 +101,6 @@ class JSONDataset(Dataset):
              # If missing, use zeros
              self.popularities = [0.0] * len(self.image_paths)
 
-        # 5. User Data (Optional)
-        if self.include_user_features:
-            with open(self.metadata_dir / f"{self.data_prefix}_user_data.json", 'r') as f:
-                 self.user_data = json.load(f)
 
     def __len__(self) -> int:
         return len(self.image_paths)
@@ -153,7 +110,7 @@ class JSONDataset(Dataset):
         # Image paths are like "train/..." or "test/..."
         # image_dir should be parent of "train" and "test" folders
         img_rel_path = self.image_paths[idx]
-        image_path = self._resolve_image_path(img_rel_path)
+        image_path = self.image_dir / img_rel_path
         
         try:
             image = Image.open(image_path).convert('RGB')
@@ -161,9 +118,7 @@ class JSONDataset(Dataset):
                 image = self.augment(image)
             image = self.clip_preprocess(image)
         except Exception as e:
-            if self._missing_image_logs < 20:
-                print(f"Error loading image {image_path}: {e}")
-                self._missing_image_logs += 1
+            print(f"Error loading image {image_path}: {e}")
             # Return dummy image or handle error
             image = torch.zeros((3, 224, 224)) 
 
@@ -182,12 +137,6 @@ class JSONDataset(Dataset):
         # 4. Popularity
         popularity = self.popularities[idx]
         
-        # 5. User Features
-        if self.include_user_features:
-             # Logic to extract user features from self.user_data[idx]
-             # This depends on structure of user_data
-             return image, text_tokens, label, popularity, torch.tensor([]) # Placeholder
-        
         return image, text_tokens, label, popularity
 
     def get_samples_by_class(self, class_id: int) -> List[Dict]:
@@ -200,7 +149,7 @@ class JSONDataset(Dataset):
         for idx in indices:
             # Image
             img_rel_path = self.image_paths[idx]
-            image_path = self._resolve_image_path(img_rel_path)
+            image_path = self.image_dir / img_rel_path
             try:
                 image = Image.open(image_path).convert('RGB')
                 image = self.clip_preprocess(image)
@@ -211,18 +160,14 @@ class JSONDataset(Dataset):
             text_item = self.text_data[idx] if idx < len(self.text_data) else {}
             if isinstance(text_item, dict):
                 title = text_item.get(self.text_field, "")
-                user_id = text_item.get("Uid")
             else:
                 title = ""
-                user_id = None
             if not isinstance(title, str):
                 title = ""
 
             samples.append({
                 "image": image,
-                "title": title,
-                "user_id": user_id,
-                "timestamp": None
+                "title": title
             })
 
         return samples
