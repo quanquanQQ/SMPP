@@ -1,29 +1,30 @@
 """
-Main SMPP Model  —  论文整体架构
-
-两阶段流水线：
-    Stage 1（分类训练）：CLIP + Prototype + Prompt + CrossModal -> L_g + L_o + L_c
-    Stage 2（回归推理）：冻结模型，提取特征向量 F -> LightGBM / CatBoost
-
-特征向量 F（论文公式 11）：
-    F = [f_I(x), f_T(t), w_i^G, w_i^L, x_tilde, V_tilde, T_tilde, s]
-    w_i^G / w_i^L 取预测类别对应的 Prompt 向量（非全类均值）。
+Main SMPP Model
+整合所有模块的完整社交媒体流行度预测模型
 """
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from typing import Dict, Optional, Tuple
+from typing import Dict, Tuple, Optional
 import clip
 
 from custom_clip_encoder import CustomCLIPTextEncoder, create_custom_text_encoder
-from dual_prompt_learner  import DualGrainedPromptLearner, create_prompt_learner
-from cross_modal_fusion   import CrossModalFusion
-from smpp_loss            import SMPPLoss
+from dual_prompt_learner import DualGrainedPromptLearner, create_prompt_learner
+from cross_modal_fusion import CrossModalFusion
+from smpp_loss import SMPPLoss
 
 
 class SMPPModel(nn.Module):
-
+    """
+    Social Media Popularity Prediction Model
+    
+    完整的多模态流行度预测模型，包含:
+    1. CLIP 图像/文本编码器
+    2. 双粒度 Prompt Learning
+    3. 跨模态融合
+    4. 多任务损失函数
+    """
+    
     def __init__(
         self,
         num_classes: int = 77,
@@ -36,22 +37,36 @@ class SMPPModel(nn.Module):
         prompt_dropout: float = 0.1,
         class_names: list = None,
         device: str = "cuda",
-        freeze_image: bool = True,
+        freeze_image: bool = False,
         freeze_text: bool = True,
-        freeze_text_embedding: bool = True,
+        freeze_text_embedding: bool = False
     ):
+        """
+        Args:
+            num_classes: 类别数量 (77个细粒度子类)
+            clip_model_name: CLIP 模型名称
+            global_ctx_length: Global Prompt 长度
+            local_ctx_length: Local Prompt 长度
+            fusion_hidden_dim: 融合模块隐藏层维度
+            fusion_num_heads: 融合模块注意力头数
+            fusion_num_layers: 融合模块 Transformer 层数
+            class_names: 类别名称列表
+            device: 计算设备
+        """
         super().__init__()
+        
         self.num_classes = num_classes
-        self.device      = device
-
-        # 1. CLIP
+        self.device = device
+        
+        # 1. 加载 CLIP 模型
         self.clip_model, self.preprocess = clip.load(clip_model_name, device=device)
+        # 强制使用 float32，减少数值溢出导致的 NaN
         self.clip_model = self.clip_model.float()
         self.feature_dim = self.clip_model.visual.output_dim
-
-        # 2. 自定义文本编码器
+        
+        # 2. 自定义文本编码器 (返回 h 和 H)
         self.text_encoder = CustomCLIPTextEncoder(self.clip_model)
-
+        
         # 3. 双粒度 Prompt Learner
         self.prompt_learner = create_prompt_learner(
             clip_model=self.clip_model,
@@ -60,312 +75,439 @@ class SMPPModel(nn.Module):
             global_ctx_length=global_ctx_length,
             local_ctx_length=local_ctx_length,
             prompt_dropout=prompt_dropout,
-            device=device,
+            device=device
         )
-
-        # 4. 跨模态融合
+        
+        # 4. 跨模态融合模块
         self.cross_modal_fusion = CrossModalFusion(
             image_dim=self.feature_dim,
             text_dim=self.feature_dim,
             hidden_dim=fusion_hidden_dim,
             num_heads=fusion_num_heads,
-            num_layers=fusion_num_layers,
+            num_layers=fusion_num_layers
         )
-
-        # 5. 原型（训练前加载）
-        self.register_buffer("visual_prototypes",
-                             torch.zeros(num_classes, self.feature_dim))
-        self.register_buffer("textual_prototypes",
-                             torch.zeros(num_classes, self.feature_dim))
-
-        # 6. 损失函数（超参数对齐论文 4.1.3）
+        
+        # 5. 原型 (需要在训练前加载或初始化)
+        self.register_buffer('visual_prototypes', torch.zeros(num_classes, self.feature_dim))
+        self.register_buffer('textual_prototypes', torch.zeros(num_classes, self.feature_dim))
+        
+        # 6. 损失函数
         self.criterion = SMPPLoss(
             temperature=0.07,
             spatial_temperature=0.1,
             temperature_visual=0.07,
-            temperature_textual=0.07,
+            temperature_textual=0.07
         )
-
-        # 7. 冻结 CLIP 主干
-        self._freeze_clip(freeze_image, freeze_text, freeze_text_embedding)
-
-    # ------------------------------------------------------------------
-
-    def _freeze_clip(self, freeze_image, freeze_text, freeze_text_embedding):
+        
+        # 冻结 CLIP 的部分参数 (可选)
+        self._freeze_clip_backbone(
+            freeze_image=freeze_image,
+            freeze_text=freeze_text,
+            freeze_text_embedding=freeze_text_embedding
+        )
+    
+    def _freeze_clip_backbone(
+        self,
+        freeze_image: bool = False,
+        freeze_text: bool = False,
+        freeze_text_embedding: bool = False
+    ):
+        """冻结 CLIP 的主干网络"""
         if freeze_image:
-            for p in self.clip_model.visual.parameters():
-                p.requires_grad = False
+            for param in self.clip_model.visual.parameters():
+                param.requires_grad = False
+        
         if freeze_text:
-            for p in self.clip_model.transformer.parameters():
-                p.requires_grad = False
+            # 只冻结 transformer，保留 token_embedding 可训练
+            for param in self.clip_model.transformer.parameters():
+                param.requires_grad = False
+
         if freeze_text_embedding:
-            for attr in ("token_embedding", "ln_final"):
-                mod = getattr(self.clip_model, attr, None)
-                if mod is not None:
-                    for p in mod.parameters():
-                        p.requires_grad = False
-            for attr in ("positional_embedding", "text_projection"):
-                t = getattr(self.clip_model, attr, None)
-                if t is not None and isinstance(t, torch.Tensor):
-                    t.requires_grad = False
-
-    def load_prototypes(self, visual_prototypes, textual_prototypes):
-        self.visual_prototypes  = visual_prototypes.to(self.device)
+            if hasattr(self.clip_model, "token_embedding"):
+                for param in self.clip_model.token_embedding.parameters():
+                    param.requires_grad = False
+            if hasattr(self.clip_model, "positional_embedding"):
+                self.clip_model.positional_embedding.requires_grad = False
+            if hasattr(self.clip_model, "ln_final"):
+                for param in self.clip_model.ln_final.parameters():
+                    param.requires_grad = False
+            if hasattr(self.clip_model, "text_projection"):
+                self.clip_model.text_projection.requires_grad = False
+    
+    def load_prototypes(self, visual_prototypes: torch.Tensor, textual_prototypes: torch.Tensor):
+        """
+        加载预先计算好的原型
+        
+        Args:
+            visual_prototypes: [num_classes, feature_dim]
+            textual_prototypes: [num_classes, feature_dim]
+        """
+        self.visual_prototypes = visual_prototypes.to(self.device)
         self.textual_prototypes = textual_prototypes.to(self.device)
-
-    def encode_image(self, images):
-        feats = self.clip_model.encode_image(images).float()
-        return feats / feats.norm(dim=-1, keepdim=True)
-
-    def encode_text(self, text_tokens):
-        return self.text_encoder(text_tokens)
-
-    # ------------------------------------------------------------------
-
-    def forward(self, images, text_tokens, labels=None, return_features=False):
-        B = images.shape[0]
-
-        # Step 1-3
-        x    = self.encode_image(images)
-        h, H = self.encode_text(text_tokens)
-        G, L = self.prompt_learner()
-
-        # Step 4: 加权原型
-        V = self.visual_prototypes.to(dtype=x.dtype)
-        T = self.textual_prototypes.to(dtype=x.dtype)
-        weights = F.softmax(torch.matmul(x, V.T), dim=1)
-        V_w = torch.matmul(weights, V)
-        T_w = torch.matmul(weights, T)
-
-        # Step 5: 融合（加权原型版，产生 x_tilde）
-        x_tilde, V_w_tilde, T_w_tilde = self.cross_modal_fusion(x, V_w, T_w)
-
+    
+    def encode_image(self, images: torch.Tensor) -> torch.Tensor:
+        """编码图像"""
+        image_features = self.clip_model.encode_image(images)
+        return image_features / image_features.norm(dim=-1, keepdim=True)
+    
+    def encode_text(self, text_tokens: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        编码文本
+        
+        Returns:
+            h: 全局文本特征 [batch_size, feature_dim]
+            H: 序列文本特征 [batch_size, seq_len, feature_dim]
+        """
+        h, H = self.text_encoder(text_tokens)
+        return h, H
+    
+    def forward(
+        self,
+        images: torch.Tensor,
+        text_tokens: torch.Tensor,
+        labels: Optional[torch.Tensor] = None,
+        return_features: bool = False
+    ) -> Dict:
+        """
+        前向传播
+        
+        Args:
+            images: [batch_size, 3, H, W] 图像数据
+            text_tokens: [batch_size, seq_len] tokenized 文本
+            labels: [batch_size] 类别标签 (训练时必须提供)
+            return_features: 是否返回中间特征 (用于特征提取)
+        
+        Returns:
+            dict: 包含损失和预测结果
+        """
+        batch_size = images.shape[0]
+        
+        # 1. 编码图像
+        image_features = self.encode_image(images)  # [B, feature_dim]
+        
+        # 2. 编码文本 (h: 全局, H: 序列)
+        text_global, text_sequence = self.encode_text(text_tokens)
+        # h: [B, feature_dim], H: [B, seq_len, feature_dim]
+        
+        # 3. 获取 Prompt 特征 (G: 全局, L: 局部)
+        global_prompt_features, local_prompt_features = self.prompt_learner()
+        # G: [num_classes, feature_dim], L: [num_classes, feature_dim]
+        
+        # 4. 为每个样本选择对应的原型 (或使用全部原型)
+        # 这里简化处理，使用全部原型
+        V = self.visual_prototypes.to(dtype=image_features.dtype)  # [num_classes, feature_dim]
+        T = self.textual_prototypes.to(dtype=image_features.dtype)  # [num_classes, feature_dim]
+        
+        # 对于每个样本，计算其与所有原型的相似度，选择 top-k 或使用所有
+        # 这里为了简化，使用平均原型或最相似的原型
+        # 计算图像与视觉原型的相似度
+        image_proto_sim = torch.matmul(image_features, V.T)  # [B, num_classes]
+        top_k = 5  # 选择 top-5 最相关的原型
+        _, top_indices = torch.topk(image_proto_sim, k=top_k, dim=1)  # [B, top_k]
+        
+        # 为每个样本选择其最相关的视觉和文本原型
+        # 简化版本：使用加权平均
+        weights = torch.softmax(image_proto_sim, dim=1)  # [B, num_classes]
+        weighted_V = torch.matmul(weights, V)  # [B, feature_dim]
+        weighted_T = torch.matmul(weights, T)  # [B, feature_dim]
+        
+        # 5. 跨模态融合
+        enhanced_image, enhanced_visual_proto, enhanced_textual_proto = \
+            self.cross_modal_fusion(
+                image_features,
+                weighted_V,
+                weighted_T
+            )
+        # x̃, Ṽ, T̃: [B, fusion_hidden_dim]
+        
+        # 准备输出
         output = {
-            "image_features":      x,
-            "text_global":         h,
-            "text_sequence":       H,
-            "enhanced_image":      x_tilde,
-            "enhanced_V_weighted": V_w_tilde,
-            "enhanced_T_weighted": T_w_tilde,
-            "global_prompt_features": G,
-            "local_prompt_features":  L,
+            'image_features': image_features,
+            'text_global': text_global,
+            'text_sequence': text_sequence,
+            'enhanced_image': enhanced_image,
+            'global_prompt_features': global_prompt_features,
+            'local_prompt_features': local_prompt_features
         }
-
-        # Step 6: 损失（对全部 K 个原型融合）
+        
+        # 6. 计算损失 (如果提供了标签)
         if labels is not None:
-            all_eV, all_eT = [], []
+            # 需要为每个样本准备对应的原型
+            # 简化处理：使用所有类别的原型
+            enhanced_V_all = enhanced_visual_proto.unsqueeze(1).expand(-1, self.num_classes, -1)
+            enhanced_T_all = enhanced_textual_proto.unsqueeze(1).expand(-1, self.num_classes, -1)
+            
+            # 更精确的做法：对所有原型进行融合
+            # 这里为了与训练逻辑一致，对所有原型进行融合
+            all_enhanced_V = []
+            all_enhanced_T = []
             for i in range(self.num_classes):
                 _, eV, eT = self.cross_modal_fusion(
-                    x,
-                    V[i:i+1].expand(B, -1),
-                    T[i:i+1].expand(B, -1),
+                    image_features,
+                    V[i:i+1].expand(batch_size, -1),
+                    T[i:i+1].expand(batch_size, -1)
                 )
-                all_eV.append(eV)
-                all_eT.append(eT)
-            eV_all = torch.stack(all_eV, dim=1)   # [B, K, hidden]
-            eT_all = torch.stack(all_eT, dim=1)
-
+                all_enhanced_V.append(eV)
+                all_enhanced_T.append(eT)
+            
+            enhanced_V_all = torch.stack(all_enhanced_V, dim=1)  # [B, num_classes, hidden_dim]
+            enhanced_T_all = torch.stack(all_enhanced_T, dim=1)  # [B, num_classes, hidden_dim]
+            
             loss_dict = self.criterion(
-                text_global_features=h,
-                text_sequence_features=H,
-                global_prompt_features=G,
-                local_prompt_features=L,
-                enhanced_image_features=x_tilde,
-                enhanced_visual_prototypes=eV_all,
-                enhanced_textual_prototypes=eT_all,
-                labels=labels,
+                text_global_features=text_global,
+                text_sequence_features=text_sequence,
+                global_prompt_features=global_prompt_features,
+                local_prompt_features=local_prompt_features,
+                enhanced_image_features=enhanced_image,
+                enhanced_visual_prototypes=enhanced_V_all,
+                enhanced_textual_prototypes=enhanced_T_all,
+                labels=labels
             )
+            
             output.update(loss_dict)
-
-        # Step 7: 特征提取
+        
+        # 7. 如果需要返回所有特征（用于下游任务）
         if return_features:
-            pred_labels = self._get_pred_labels(output)
-            output["all_features"] = self.extract_all_features(
-                image_features=x,
-                text_global=h,
-                enhanced_image=x_tilde,
-                enhanced_V=V_w_tilde,
-                enhanced_T=T_w_tilde,
-                global_prompts=G,
-                local_prompts=L,
-                pred_labels=pred_labels,
+            output['all_features'] = self.extract_all_features(
+                image_features, text_global, text_sequence,
+                enhanced_image, enhanced_visual_proto, enhanced_textual_proto,
+                global_prompt_features, local_prompt_features
             )
-
+        
         return output
-
-    def _get_pred_labels(self, output):
-        if all(k in output for k in
-               ("logits_global", "logits_local", "logits_visual")):
-            avg = (output["logits_global"]
-                   + output["logits_local"]
-                   + output["logits_visual"]) / 3
-            return avg.argmax(dim=-1)
-        return None
-
-    # ------------------------------------------------------------------
-    # F = [f_I(x), f_T(t), w^G_i, w^L_i, x_tilde, V_tilde, T_tilde, s]
-    # ------------------------------------------------------------------
-
+    
     def extract_all_features(
         self,
         image_features,
         text_global,
+        text_sequence,
         enhanced_image,
         enhanced_V,
         enhanced_T,
         global_prompts,
-        local_prompts,
-        pred_labels=None,
-        user_features=None,
-    ):
-        B = image_features.shape[0]
-        if pred_labels is not None:
-            pred_labels = pred_labels.to(global_prompts.device)
-            w_G = global_prompts[pred_labels]
-            w_L = local_prompts[pred_labels]
-        else:
-            w_G = global_prompts.mean(0).unsqueeze(0).expand(B, -1)
-            w_L = local_prompts.mean(0).unsqueeze(0).expand(B, -1)
-
-        parts = [image_features, text_global, w_G, w_L,
-                 enhanced_image, enhanced_V, enhanced_T]
-        if user_features is not None:
-            parts.append(user_features.to(image_features.device))
-        return torch.cat(parts, dim=-1)
-
-    # ------------------------------------------------------------------
-
-    def predict_class(self, images, text_tokens):
+        local_prompts
+    ) -> torch.Tensor:
+        """
+        提取所有特征用于下游回归任务
+        
+        F = [f_I(x), f_I(t), w_i^G, w_i^L, x̃, Ṽ, T̃, s]
+        
+        Returns:
+            features: [batch_size, total_feature_dim]
+        """
+        batch_size = image_features.shape[0]
+        
+        # 获取每个样本对应类别的 prompt (需要预测或使用真实标签)
+        # 这里简化：使用所有 prompt 的平均
+        global_prompt_avg = global_prompts.mean(dim=0).unsqueeze(0).expand(batch_size, -1)
+        local_prompt_avg = local_prompts.mean(dim=0).unsqueeze(0).expand(batch_size, -1)
+        
+        # 拼接所有特征
+        all_features = torch.cat([
+            image_features,         # f_I(x)
+            text_global,            # f_T(t)
+            global_prompt_avg,      # w^G
+            local_prompt_avg,       # w^L
+            enhanced_image,         # x̃
+            enhanced_V,             # Ṽ
+            enhanced_T              # T̃
+            # 注意: 用户行为特征 s 需要从外部提供
+        ], dim=-1)
+        
+        return all_features
+    
+    def predict_class(self, images: torch.Tensor, text_tokens: torch.Tensor) -> torch.Tensor:
+        """
+        预测类别
+        
+        Returns:
+            predictions: [batch_size] 预测的类别
+        """
         with torch.no_grad():
-            out = self.forward(images, text_tokens)
-            avg = (out["logits_global"]
-                   + out["logits_local"]
-                   + out["logits_visual"]) / 3
-            return avg.argmax(dim=-1)
-
-    def extract_features_for_regression(self, images, text_tokens,
-                                         user_features=None):
+            output = self.forward(images, text_tokens, return_features=False)
+            # 使用三个 logits 的平均进行预测
+            logits = (
+                output['logits_global'] +
+                output['logits_local'] +
+                output['logits_visual']
+            ) / 3
+            predictions = logits.argmax(dim=-1)
+        
+        return predictions
+    
+    def extract_features_for_regression(
+        self,
+        images: torch.Tensor,
+        text_tokens: torch.Tensor,
+        user_features: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        提取特征用于下游回归任务 (GBDT)
+        
+        Args:
+            images: 图像数据
+            text_tokens: 文本 tokens
+            user_features: 用户行为特征 (可选)
+        
+        Returns:
+            features: [batch_size, feature_dim] 用于回归的特征向量
+        """
         with torch.no_grad():
-            # 第一次 forward：获取 pred_labels
-            out = self.forward(images, text_tokens, labels=None,
-                               return_features=False)
-            pred_labels = self._get_pred_labels(out)
-            G, L = self.prompt_learner()
-            feats = self.extract_all_features(
-                image_features=out["image_features"],
-                text_global=out["text_global"],
-                enhanced_image=out["enhanced_image"],
-                enhanced_V=out["enhanced_V_weighted"],
-                enhanced_T=out["enhanced_T_weighted"],
-                global_prompts=G,
-                local_prompts=L,
-                pred_labels=pred_labels,
-                user_features=user_features,
-            )
-        return feats
+            output = self.forward(images, text_tokens, return_features=True)
+            features = output['all_features']
+            
+            # 如果提供了用户特征，拼接上
+            if user_features is not None:
+                features = torch.cat([features, user_features], dim=-1)
+        
+        return features
 
-
-# ======================================================================
-# Trainer
-# ======================================================================
 
 class SMPPTrainer:
-
-    def __init__(self, model, optimizer, device="cuda"):
-        self.model     = model
+    """
+    SMPP 模型训练器
+    """
+    
+    def __init__(
+        self,
+        model: SMPPModel,
+        optimizer: torch.optim.Optimizer,
+        device: str = "cuda"
+    ):
+        self.model = model
         self.optimizer = optimizer
-        self.device    = device
+        self.device = device
         self.model.to(device)
-
-    def train_epoch(self, dataloader, epoch):
+    
+    def train_epoch(self, dataloader, epoch: int):
+        """训练一个 epoch"""
         self.model.train()
-        total_loss = total_g = total_o = total_c = 0.0
-        correct = total = 0
-
-        for step, batch in enumerate(dataloader):
-            if len(batch) >= 4:
-                images, text_tokens, labels, *_ = batch
-            else:
+        total_loss = 0
+        total_loss_g = 0
+        total_loss_o = 0
+        total_loss_c = 0
+        correct = 0
+        total = 0
+        
+        for batch_idx, batch in enumerate(dataloader):
+            # Unpack batch depending on content
+            if len(batch) == 3:
                 images, text_tokens, labels = batch
-
-            images      = images.to(self.device)
+            elif len(batch) >= 4:
+                images, text_tokens, labels, popularities, *extra = batch
+                
+            images = images.to(self.device)
             text_tokens = text_tokens.to(self.device)
-            labels      = labels.to(self.device)
-
-            out  = self.model(images, text_tokens, labels)
-            loss = out["loss"]
+            labels = labels.to(self.device)
+            
+            # 前向传播
+            output = self.model(images, text_tokens, labels)
+            
+            # 反向传播
+            loss = output['loss']
             self.optimizer.zero_grad()
             loss.backward()
             self.optimizer.step()
-
+            
+            # 统计
             total_loss += loss.item()
-            total_g    += out["loss_global"].item()
-            total_o    += out["loss_local"].item()
-            total_c    += out["loss_visual"].item()
-
-            avg = (out["logits_global"] + out["logits_local"]
-                   + out["logits_visual"]) / 3
-            correct += (avg.argmax(-1) == labels).sum().item()
-            total   += labels.size(0)
-
-            if (step + 1) % 100 == 0:
-                n = step + 1
-                print(f"Epoch {epoch}  Step {n}/{len(dataloader)}  "
-                      f"Loss={total_loss/n:.4f}  Acc={100*correct/total:.2f}%")
-
-        n = len(dataloader)
-        print(f"\nEpoch {epoch}  Loss={total_loss/n:.4f}  "
-              f"Lg={total_g/n:.4f}  Lo={total_o/n:.4f}  Lc={total_c/n:.4f}  "
-              f"Acc={100*correct/total:.2f}%")
-        return total_loss / n, 100 * correct / total
-
-    @torch.no_grad()
-    def validate(self, dataloader):
-        self.model.eval()
-        total_loss = correct = total = 0
-
-        for batch in dataloader:
-            if len(batch) >= 4:
-                images, text_tokens, labels, *_ = batch
-            else:
-                images, text_tokens, labels = batch
-
-            images      = images.to(self.device)
-            text_tokens = text_tokens.to(self.device)
-            labels      = labels.to(self.device)
-
-            out = self.model(images, text_tokens, labels)
-            total_loss += out["loss"].item()
-            avg = (out["logits_global"] + out["logits_local"]
-                   + out["logits_visual"]) / 3
-            correct += (avg.argmax(-1) == labels).sum().item()
-            total   += labels.size(0)
-
+            total_loss_g += output['loss_global'].item()
+            total_loss_o += output['loss_local'].item()
+            total_loss_c += output['loss_visual'].item()
+            
+            # 计算准确率 (使用平均 logits)
+            logits = (
+                output['logits_global'] +
+                output['logits_local'] +
+                output['logits_visual']
+            ) / 3
+            pred = logits.argmax(dim=-1)
+            correct += (pred == labels).sum().item()
+            total += labels.size(0)
+            
+            if (batch_idx + 1) % 100 == 0:
+                print(f"Epoch {epoch}, Batch {batch_idx+1}/{len(dataloader)}, "
+                      f"Loss: {loss.item():.4f}, "
+                      f"Acc: {100 * correct / total:.2f}%")
+        
         avg_loss = total_loss / len(dataloader)
-        avg_acc  = 100 * correct / total
-        print(f"Validation — Loss={avg_loss:.4f}  Acc={avg_acc:.2f}%")
+        avg_acc = 100 * correct / total
+        
+        print(f"\nEpoch {epoch} Summary:")
+        print(f"  Total Loss: {avg_loss:.4f}")
+        print(f"  L_g: {total_loss_g / len(dataloader):.4f}")
+        print(f"  L_o: {total_loss_o / len(dataloader):.4f}")
+        print(f"  L_c: {total_loss_c / len(dataloader):.4f}")
+        print(f"  Accuracy: {avg_acc:.2f}%")
+        
         return avg_loss, avg_acc
+    
+    def validate(self, dataloader):
+        """验证模型"""
+        self.model.eval()
+        total_loss = 0
+        correct = 0
+        total = 0
+        
+        with torch.no_grad():
+            for batch in dataloader:
+                # Unpack batch depending on content
+                if len(batch) == 3:
+                    images, text_tokens, labels = batch
+                elif len(batch) >= 4:
+                    images, text_tokens, labels, popularities, *extra = batch
 
-    def save_checkpoint(self, path, epoch, loss):
+                images = images.to(self.device)
+                text_tokens = text_tokens.to(self.device)
+                labels = labels.to(self.device)
+                
+                output = self.model(images, text_tokens, labels)
+                
+                total_loss += output['loss'].item()
+                
+                logits = (
+                    output['logits_global'] +
+                    output['logits_local'] +
+                    output['logits_visual']
+                ) / 3
+                pred = logits.argmax(dim=-1)
+                correct += (pred == labels).sum().item()
+                total += labels.size(0)
+        
+        avg_loss = total_loss / len(dataloader)
+        avg_acc = 100 * correct / total
+        
+        print(f"Validation - Loss: {avg_loss:.4f}, Accuracy: {avg_acc:.2f}%")
+        
+        return avg_loss, avg_acc
+    
+    def save_checkpoint(self, path: str, epoch: int, loss: float):
+        """保存模型检查点"""
         torch.save({
-            "epoch":                epoch,
-            "model_state_dict":     self.model.state_dict(),
-            "optimizer_state_dict": self.optimizer.state_dict(),
-            "loss":                 loss,
+            'epoch': epoch,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'loss': loss,
         }, path)
-        print(f"[Checkpoint] Saved -> {path}")
+        print(f"Checkpoint saved to {path}")
+    
+    def load_checkpoint(self, path: str):
+        """加载模型检查点"""
+        checkpoint = torch.load(path, map_location=self.device)
+        state_dict = checkpoint['model_state_dict']
 
-    def load_checkpoint(self, path):
-        ckpt       = torch.load(path, map_location=self.device)
-        state_dict = ckpt["model_state_dict"]
-        is_dp      = isinstance(self.model, torch.nn.DataParallel)
-        has_pfx    = any(k.startswith("module.") for k in state_dict)
-        if is_dp and not has_pfx:
+        model_is_dp = isinstance(self.model, torch.nn.DataParallel)
+        has_module_prefix = any(k.startswith("module.") for k in state_dict.keys())
+
+        # Align state_dict keys with model
+        if model_is_dp and not has_module_prefix:
             state_dict = {f"module.{k}": v for k, v in state_dict.items()}
-        elif (not is_dp) and has_pfx:
+        elif (not model_is_dp) and has_module_prefix:
             state_dict = {k.replace("module.", "", 1): v for k, v in state_dict.items()}
+
         self.model.load_state_dict(state_dict, strict=False)
-        self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        print(f"[Checkpoint] Loaded <- {path}  "
-              f"Epoch={ckpt['epoch']}  Loss={ckpt['loss']:.4f}")
-        return ckpt["epoch"], ckpt["loss"]
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        epoch = checkpoint['epoch']
+        loss = checkpoint['loss']
+        print(f"Checkpoint loaded from {path}, Epoch: {epoch}, Loss: {loss:.4f}")
+        return epoch, loss
