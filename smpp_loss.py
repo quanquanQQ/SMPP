@@ -25,13 +25,10 @@ from typing import Tuple
 class GlobalTextAlignmentLoss(nn.Module):
     """L_g：全局文本对齐损失（论文公式 4）"""
 
-    # ── 修改一A：增加 class_weights 参数，传入 CrossEntropyLoss ──────
-    def __init__(self, temperature: float = 0.07,
-                 class_weights: torch.Tensor = None):
+    def __init__(self, temperature: float = 0.07):
         super().__init__()
         self.temperature = temperature
-        self.ce = nn.CrossEntropyLoss(weight=class_weights)
-    # ────────────────────────────────────────────────────────────────
+        self.ce = nn.CrossEntropyLoss()
 
     def forward(
         self,
@@ -57,18 +54,15 @@ class LocalTextAlignmentLoss(nn.Module):
         p_i'   = sum_j(attn_{ij} * P_{ij})
     """
 
-    # ── 修改一B：增加 class_weights 参数 ────────────────────────────
     def __init__(
         self,
         temperature: float = 0.07,
         spatial_temperature: float = 0.1,
-        class_weights: torch.Tensor = None,
     ):
         super().__init__()
         self.temperature         = temperature
         self.spatial_temperature = spatial_temperature
-        self.ce = nn.CrossEntropyLoss(weight=class_weights)
-    # ────────────────────────────────────────────────────────────────
+        self.ce = nn.CrossEntropyLoss()
 
     def forward(
         self,
@@ -103,18 +97,15 @@ class VisualPrototypeAlignmentLoss(nn.Module):
     logits = (logits_V + logits_T) / 2  →  CrossEntropy
     """
 
-    # ── 修改一C：增加 class_weights 参数 ────────────────────────────
     def __init__(
         self,
         temperature_visual: float = 0.07,
         temperature_textual: float = 0.07,
-        class_weights: torch.Tensor = None,
     ):
         super().__init__()
         self.tau_v = temperature_visual
         self.tau_t = temperature_textual
-        self.ce    = nn.CrossEntropyLoss(weight=class_weights)
-    # ────────────────────────────────────────────────────────────────
+        self.ce    = nn.CrossEntropyLoss()
 
     def forward(
         self,
@@ -153,7 +144,6 @@ class SMPPLoss(nn.Module):
     SMPP 总损失：L = L_g + L_o + L_c  （各项等权，论文未指定不同权重）
     """
 
-    # ── 修改一D：SMPPLoss 接收 class_weights 并传给三个子损失 ────────
     def __init__(
         self,
         temperature: float = 0.07,
@@ -161,22 +151,18 @@ class SMPPLoss(nn.Module):
         temperature_visual: float = 0.07,
         temperature_textual: float = 0.07,
         loss_weights: dict = None,
-        class_weights: torch.Tensor = None,   # ← 新增
     ):
         super().__init__()
-        self.global_loss = GlobalTextAlignmentLoss(
-            temperature, class_weights=class_weights)
-        self.local_loss  = LocalTextAlignmentLoss(
-            temperature, spatial_temperature, class_weights=class_weights)
-        self.visual_loss = VisualPrototypeAlignmentLoss(
-            temperature_visual, temperature_textual, class_weights=class_weights)
+        self.global_loss = GlobalTextAlignmentLoss(temperature)
+        self.local_loss  = LocalTextAlignmentLoss(temperature, spatial_temperature)
+        self.visual_loss = VisualPrototypeAlignmentLoss(temperature_visual,
+                                                        temperature_textual)
 
         self.loss_weights = loss_weights or {
             "global": 1.0,
             "local":  1.0,
             "visual": 1.0,
         }
-    # ────────────────────────────────────────────────────────────────
 
     def forward(
         self,
